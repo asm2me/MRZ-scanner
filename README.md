@@ -5,9 +5,9 @@ This simple web application uses the webcam to scan the Machine Readable Zone (M
 ## How it works
 
 1. **index.html** opens the camera and starts capturing frames.
-2. **Tesseract.js** performs OCR on each frame to locate MRZ text.
-3. The parsed text is fed to the **mrz** library which extracts structured fields.
-4. On success, the page redirects to **result.html** with the data encoded in the query string.
+2. **Tesseract.js** performs OCR on the bottom portion of each frame and/or the built-in `mrz` image parser.
+3. The **mrz** library parses the MRZ text and ensures all checksums are valid (`result.valid === true`).
+4. When a full, checksum‑correct MRZ is read a short beep (like a barcode reader) is played and the app navigates to **result.html** with the extracted data.
 5. **result.html** reads the query parameters and populates a form with the passport information.
 
 ## Running locally

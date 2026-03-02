@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(start http://localhost:8000)",
+      "Bash(npx serve -l 8000 .)"
+    ]
+  }
+}
