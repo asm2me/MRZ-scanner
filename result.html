@@ -1,0 +1,41 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>MRZ Result</title>
+    <style>
+        body { font-family: sans-serif; padding: 2rem; }
+        label { display: block; margin-top: 1rem; }
+        input { width: 100%; padding: .5rem; }
+    </style>
+</head>
+<body>
+    <h1>Passport Information</h1>
+    <form id="infoForm">
+        <label>Document type: <input name="documentCode" readonly /></label>
+        <label>Issuing country: <input name="issuer" readonly /></label>
+        <label>Last name: <input name="surname" readonly /></label>
+        <label>Given names: <input name="givenNames" readonly /></label>
+        <label>Passport number: <input name="passportNumber" readonly /></label>
+        <label>Nationality: <input name="nationality" readonly /></label>
+        <label>Date of birth: <input name="birthDate" readonly /></label>
+        <label>Sex: <input name="sex" readonly /></label>
+        <label>Expiration date: <input name="expiryDate" readonly /></label>
+        <label>Personal number: <input name="personalNumber" readonly /></label>
+    </form>
+    <script>
+        function populate() {
+            const params = new URLSearchParams(window.location.search);
+            const form = document.getElementById('infoForm');
+            for (const [key, value] of params.entries()) {
+                const input = form.elements[key];
+                if (input) {
+                    input.value = value;
+                }
+            }
+        }
+        populate();
+    </script>
+</body>
+</html>
