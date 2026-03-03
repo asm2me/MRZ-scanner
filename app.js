@@ -1,7 +1,6 @@
 (function () {
     /* ── DOM ──────────────────────────────────────────────────────────────── */
     const video          = document.getElementById('video');
-    const canvas         = document.getElementById('canvas');
     const overlay        = document.getElementById('overlay');
     const message        = document.getElementById('message');
     const permTip        = document.getElementById('perm-tip');
@@ -14,7 +13,6 @@
     const ocrText        = document.getElementById('ocr-text');
     const ocrLines       = document.getElementById('ocr-lines');
     const ocrFields      = document.getElementById('ocr-fields');
-    const ctx            = canvas.getContext('2d');
     const ovCtx          = overlay.getContext('2d');
 
     /* ── Passport guide proportions (TD-3: 125 mm × 88 mm) ───────────────── */
@@ -89,7 +87,7 @@
         ovCtx.font = `${Math.max(11, W * 0.024)}px sans-serif`;
         ovCtx.fillStyle = 'rgba(255,255,255,0.85)';
         ovCtx.textBaseline = 'bottom';
-        ovCtx.fillText('Align passport within the guide', W / 2, py - 8);
+        ovCtx.fillText('Align MRZ strip with the blue band below', W / 2, py - 8);
     }
 
     function resizeOverlay() {
@@ -98,44 +96,155 @@
         drawOverlay();
     }
 
-    /* ── MRZ strip capture ────────────────────────────────────────────────── */
-    // Crops the MRZ band from the live video frame and scales it up 3× for OCR.
-    // No binarization: Tesseract's mrz model handles colour/greyscale natively.
-    function captureMRZStrip() {
-        ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+    /* ── Adaptive threshold ────────────────────────────────────────────────── */
+    // Converts the canvas to a B&W image using a local-mean threshold.
+    // Eliminates lighting gradients and background clutter so Tesseract's
+    // internal skew-correction (PSM=3 projection profile) works reliably.
+    function adaptiveThreshold(canvas) {
         const W = canvas.width, H = canvas.height;
+        const c2d = canvas.getContext('2d');
+        const id = c2d.getImageData(0, 0, W, H);
+        const d = id.data;
 
-        const py   = P.yFrac  * H;
-        const ph   = P.hFrac  * H;
-        const mrzH = P.mrzFrac * ph;
-        const mrzY = py + ph - mrzH;
+        // Grayscale
+        const g = new Uint8Array(W * H);
+        for (let i = 0; i < g.length; i++) {
+            const j = i * 4;
+            g[i] = (d[j] * 77 + d[j + 1] * 150 + d[j + 2] * 29) >> 8;
+        }
 
-        // Add 25 % vertical padding so slight vertical misalignment is tolerated
-        const padH = mrzH * 0.25;
-        const sy   = Math.max(0, Math.floor(mrzY - padH));
-        const sh   = Math.min(H - sy, Math.ceil(mrzH + padH * 2));
+        // Integral image for O(1) local-mean lookup
+        const W1 = W + 1;
+        const ii = new Int32Array(W1 * (H + 1));
+        for (let y = 0; y < H; y++)
+            for (let x = 0; x < W; x++)
+                ii[(y + 1) * W1 + (x + 1)] = g[y * W + x]
+                    + ii[y * W1 + (x + 1)] + ii[(y + 1) * W1 + x] - ii[y * W1 + x];
 
-        const src = document.createElement('canvas');
-        src.width  = W;
-        src.height = sh;
-        src.getContext('2d').putImageData(ctx.getImageData(0, sy, W, sh), 0, 0);
+        // Local threshold: pixel is "dark" if it is C levels below the local mean
+        const half = 20, C = 12;  // wider window + stronger bias for camera images
+        for (let y = 0; y < H; y++) {
+            const y1 = Math.max(0, y - half), y2 = Math.min(H, y + half + 1);
+            for (let x = 0; x < W; x++) {
+                const x1 = Math.max(0, x - half), x2 = Math.min(W, x + half + 1);
+                const area = (y2 - y1) * (x2 - x1);
+                const s = ii[y2 * W1 + x2] - ii[y1 * W1 + x2]
+                        - ii[y2 * W1 + x1] + ii[y1 * W1 + x1];
+                const px = g[y * W + x] < (s / area) - C ? 0 : 255;
+                const j = (y * W + x) * 4;
+                d[j] = d[j + 1] = d[j + 2] = px; d[j + 3] = 255;
+            }
+        }
+        c2d.putImageData(id, 0, 0);
+    }
 
-        // 3× upscale — larger glyphs improve Tesseract classification accuracy
-        const SCALE = 3;
-        const dst   = document.createElement('canvas');
-        dst.width   = W * SCALE;
-        dst.height  = sh * SCALE;
-        const dCtx  = dst.getContext('2d');
-        dCtx.imageSmoothingEnabled  = true;
-        dCtx.imageSmoothingQuality  = 'high';
-        dCtx.drawImage(src, 0, 0, dst.width, dst.height);
+    /* ── Skew detection ────────────────────────────────────────────────────── */
+    // Estimates the clockwise tilt of text rows in a B&W canvas.
+    // Projection-profile approach: for each candidate angle, project dark pixels
+    // onto the y-axis after a CCW rotation of that angle and measure row-sum
+    // variance. The angle with maximum variance is the CW text-tilt angle.
+    // Operates on a 4× downsampled copy for speed (~30 ms at 1080 p).
+    function estimateSkew(bwCanvas) {
+        const W = bwCanvas.width, H = bwCanvas.height;
+        const d = bwCanvas.getContext('2d').getImageData(0, 0, W, H).data;
 
-        // Mirror to the debug preview canvas
-        ocrPreview.width  = dst.width;
-        ocrPreview.height = dst.height;
-        ocrPreview.getContext('2d').drawImage(dst, 0, 0);
+        const step = 4;
+        const sw = Math.ceil(W / step), sh = Math.ceil(H / step);
+        const g = new Uint8Array(sw * sh);
+        for (let y = 0; y < sh; y++)
+            for (let x = 0; x < sw; x++)
+                g[y * sw + x] = d[((y * step) * W + x * step) * 4] < 128 ? 1 : 0;
 
+        const cx = sw / 2, cy = sh / 2;
+        const projLen = sw + sh;   // large enough for ±20° rotation
+        let bestAngle = 0, bestVar = -1;
+
+        for (let deg = -20; deg <= 20; deg += 1) {
+            const rad = deg * Math.PI / 180;
+            const cos = Math.cos(rad), sin = Math.sin(rad);
+            const proj = new Int32Array(projLen);
+            for (let y = 0; y < sh; y++)
+                for (let x = 0; x < sw; x++)
+                    if (g[y * sw + x]) {
+                        // CCW rotation by deg corrects CW tilt:
+                        // new_y = -(x-cx)*sin + (y-cy)*cos + cy
+                        const ry = Math.round(-(x - cx) * sin + (y - cy) * cos + cy);
+                        if (ry >= 0 && ry < projLen) proj[ry]++;
+                    }
+            // Variance of projection = sharpness (max when text rows are horizontal)
+            let sum = 0, sum2 = 0;
+            for (let i = 0; i < sh; i++) { sum += proj[i]; sum2 += proj[i] * proj[i]; }
+            const v = sum2 - (sum * sum) / sh;
+            if (v > bestVar) { bestVar = v; bestAngle = deg; }
+        }
+        return bestAngle;
+    }
+
+    /* ── Canvas rotation ────────────────────────────────────────────────────── */
+    // Rotates src CCW by cwAngle degrees, filling the expanded canvas with white.
+    function rotateCanvas(src, cwAngle) {
+        if (Math.abs(cwAngle) < 0.5) return src;
+        const rad = cwAngle * Math.PI / 180;
+        const W = src.width, H = src.height;
+        const acos = Math.abs(Math.cos(rad)), asin = Math.abs(Math.sin(rad));
+        const nW = Math.round(W * acos + H * asin);
+        const nH = Math.round(W * asin + H * acos);
+        const dst = document.createElement('canvas');
+        dst.width = nW; dst.height = nH;
+        const c = dst.getContext('2d');
+        c.fillStyle = '#fff';
+        c.fillRect(0, 0, nW, nH);
+        c.translate(nW / 2, nH / 2);
+        c.rotate(-rad);   // negative = CCW in canvas (corrects CW tilt)
+        c.drawImage(src, -W / 2, -H / 2);
         return dst;
+    }
+
+    /* ── MRZ-region capture ────────────────────────────────────────────────── */
+    // Crops to the MRZ band, 2× upscales, adaptive-thresholds, detects + corrects
+    // skew via projection profile, then returns the clean B&W canvas for OCR.
+    // 2× (not 3×) keeps pixel count low → fast PSM=6 OCR.
+    function captureFrame() {
+        const vW = video.videoWidth, vH = video.videoHeight;
+        if (!vW || !vH) return null;
+
+        // Guide-relative MRZ bounds in video-pixel space
+        const gX = P.xFrac * vW;
+        const gY = P.yFrac * vH;
+        const gW = P.wFrac * vW;
+        const gH = P.hFrac * vH;
+
+        const mrzH = gH * P.mrzFrac;
+        const padV = mrzH * 0.8;   // 80 % extra height above MRZ baseline for tilt tolerance
+        const padH = gW * 0.03;    // 3 % extra width each side
+
+        const cx = Math.max(0, Math.floor(gX - padH));
+        const cy = Math.max(0, Math.floor(gY + gH - mrzH - padV));
+        const cw = Math.min(vW - cx, Math.ceil(gW + padH * 2));
+        const ch = Math.min(vH - cy, Math.ceil(mrzH + padV + mrzH * 0.1));
+
+        // 2× upscale — sufficient glyph size, ~40 % fewer pixels than 3× → faster
+        const scale = 2;
+        const dst = document.createElement('canvas');
+        dst.width  = Math.round(cw * scale);
+        dst.height = Math.round(ch * scale);
+        const dCtx = dst.getContext('2d');
+        dCtx.imageSmoothingEnabled = true;
+        dCtx.imageSmoothingQuality = 'high';
+        dCtx.drawImage(video, cx, cy, cw, ch, 0, 0, dst.width, dst.height);
+
+        adaptiveThreshold(dst);
+
+        // Our own skew correction — more reliable than PSM=3 on a 2-line strip
+        const skew = estimateSkew(dst);
+        const corrected = rotateCanvas(dst, skew);
+
+        // Debug preview capped at 640 px wide
+        const ps = Math.min(1, 640 / corrected.width);
+        ocrPreview.width  = Math.round(corrected.width  * ps);
+        ocrPreview.height = Math.round(corrected.height * ps);
+        ocrPreview.getContext('2d').drawImage(corrected, 0, 0, ocrPreview.width, ocrPreview.height);
+        return corrected;
     }
 
     /* ── Tesseract worker ─────────────────────────────────────────────────── */
@@ -157,7 +266,7 @@
             },
         });
         await worker.setParameters({
-            tessedit_pageseg_mode: '6',   // single uniform block of text
+            tessedit_pageseg_mode: '6',   // single uniform text block — faster; skew handled by rotateCanvas
         });
     }
 
@@ -174,10 +283,10 @@
     function showDebugFields(parsed) {
         if (!parsed || !parsed.fields) { ocrFields.style.display = 'none'; return; }
         const LABELS = {
-            documentCode: 'Doc type', issuer: 'Issuer', surname: 'Surname',
-            givenNames: 'Given names', passportNumber: 'Doc number',
+            documentCode: 'Doc type', issuingState: 'Issuer', lastName: 'Surname',
+            firstName: 'Given names', documentNumber: 'Doc number',
             nationality: 'Nationality', birthDate: 'Birth date',
-            sex: 'Sex', expiryDate: 'Expiry', personalNumber: 'Personal no.',
+            sex: 'Sex', expirationDate: 'Expiry', personalNumber: 'Personal no.',
         };
         const rows = Object.entries(parsed.fields)
             .filter(([, v]) => v)
@@ -194,7 +303,8 @@
     async function recognizeMRZ() {
         if (!worker) return null;
 
-        const strip = captureMRZStrip();
+        const strip = captureFrame();
+        if (!strip) return null;
         const { data: { text } } = await worker.recognize(strip);
 
         ocrText.textContent = text || '(empty)';
@@ -255,12 +365,15 @@
     function playBeep() {
         try {
             const ac = getAudioCtx();
-            if (ac.state === 'suspended') { ac.resume(); return; }
-            const o = ac.createOscillator();
-            o.frequency.value = 1000;
-            o.connect(ac.destination);
-            o.start();
-            o.stop(ac.currentTime + 0.2);
+            const doBeep = () => {
+                const o = ac.createOscillator();
+                o.frequency.value = 1000;
+                o.connect(ac.destination);
+                o.start();
+                o.stop(ac.currentTime + 0.2);
+            };
+            if (ac.state === 'suspended') ac.resume().then(doBeep).catch(() => {});
+            else doBeep();
         } catch (e) {}
     }
 
@@ -269,7 +382,7 @@
 
     async function scanFrame() {
         const now = Date.now();
-        if (!busy && now - lastScan > 800) {
+        if (!busy && now - lastScan > 500) {
             lastScan = now;
             busy = true;
             if (worker) message.textContent = 'Scanning…';
@@ -278,9 +391,8 @@
                 if (parsed && parsed.valid) {
                     message.textContent = 'MRZ detected — redirecting…';
                     playBeep();
-                    const params = new URLSearchParams();
-                    for (const k in parsed.fields) params.set(k, parsed.fields[k]);
-                    window.location.href = 'result.html?' + params.toString();
+                    sessionStorage.setItem('mrzData', JSON.stringify(parsed.fields));
+                    setTimeout(() => { window.location.href = 'result.html'; }, 350);
                     return;
                 } else {
                     message.textContent = worker
@@ -392,7 +504,7 @@
         }
         try {
             const stream = await navigator.mediaDevices.getUserMedia({
-                video: { facingMode: 'environment', width: { ideal: 1280 }, height: { ideal: 720 } },
+                video: { facingMode: 'environment', width: { ideal: 1920 }, height: { ideal: 1080 } },
             });
             if (permState === 'prompt') {
                 permTip.textContent =
@@ -405,8 +517,6 @@
             const caps = videoTrack.getCapabilities ? videoTrack.getCapabilities() : {};
             setupFocusControls(caps);
             video.addEventListener('loadedmetadata', () => {
-                canvas.width  = video.videoWidth;
-                canvas.height = video.videoHeight;
                 resizeOverlay();
                 requestAnimationFrame(scanFrame);
             });

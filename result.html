@@ -14,25 +14,32 @@
     <h1>Passport Information</h1>
     <form id="infoForm">
         <label>Document type: <input name="documentCode" readonly /></label>
-        <label>Issuing country: <input name="issuer" readonly /></label>
-        <label>Last name: <input name="surname" readonly /></label>
-        <label>Given names: <input name="givenNames" readonly /></label>
-        <label>Passport number: <input name="passportNumber" readonly /></label>
+        <label>Issuing country: <input name="issuingState" readonly /></label>
+        <label>Last name: <input name="lastName" readonly /></label>
+        <label>Given names: <input name="firstName" readonly /></label>
+        <label>Passport number: <input name="documentNumber" readonly /></label>
         <label>Nationality: <input name="nationality" readonly /></label>
         <label>Date of birth: <input name="birthDate" readonly /></label>
         <label>Sex: <input name="sex" readonly /></label>
-        <label>Expiration date: <input name="expiryDate" readonly /></label>
+        <label>Expiration date: <input name="expirationDate" readonly /></label>
         <label>Personal number: <input name="personalNumber" readonly /></label>
     </form>
     <script>
         function populate() {
-            const params = new URLSearchParams(window.location.search);
             const form = document.getElementById('infoForm');
-            for (const [key, value] of params.entries()) {
+            // sessionStorage is preferred — serve's clean-URL 301 redirect strips query params
+            let data = {};
+            try {
+                const stored = sessionStorage.getItem('mrzData');
+                if (stored) { data = JSON.parse(stored); sessionStorage.removeItem('mrzData'); }
+            } catch(e) {}
+            // Fall back to URL query params (works with python -m http.server etc.)
+            if (!Object.keys(data).length) {
+                for (const [k, v] of new URLSearchParams(window.location.search).entries()) data[k] = v;
+            }
+            for (const [key, value] of Object.entries(data)) {
                 const input = form.elements[key];
-                if (input) {
-                    input.value = value;
-                }
+                if (input) input.value = value;
             }
         }
         populate();
