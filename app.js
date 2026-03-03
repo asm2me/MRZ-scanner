@@ -232,38 +232,38 @@
         return dst;
     }
 
-    function toDataURL({ imgData, w, h }) {
+    // binarize=true for tight MRZ crop; false for full-frame (global Otsu
+    // threshold destroys text when background dominates the image).
+    function toDataURL({ imgData, w, h }, binarize = false) {
         const src = document.createElement('canvas');
         src.width = w; src.height = h;
         src.getContext('2d').putImageData(imgData, 0, 0);
 
-        // 1.5× upscale — the full frame is already large; a modest boost helps
-        // Tesseract without making the image unwieldy.
-        // Bilinear + 1 px blur before binarization smooths sensor noise
-        // so Otsu finds a clean text/background boundary.
-        const scale = 1.5;
+        // No upscale for full frame (already large); 3× for a tight crop.
+        const scale = binarize ? 3 : 1;
         const dst   = document.createElement('canvas');
         dst.width   = w * scale;
         dst.height  = h * scale;
         const dCtx  = dst.getContext('2d');
         dCtx.imageSmoothingEnabled = true;
         dCtx.imageSmoothingQuality = 'high';
-        dCtx.filter = 'blur(1px)';
+        if (binarize) dCtx.filter = 'blur(1px)';
         dCtx.drawImage(src, 0, 0, dst.width, dst.height);
         dCtx.filter = 'none';
 
-        otsuBinarize(dCtx, dst.width, dst.height);
-
-        // Detect tilt and straighten before OCR
-        const tilt      = estimateTilt(dst);
-        const corrected = deskew(dst, tilt);
+        let out = dst;
+        if (binarize) {
+            otsuBinarize(dCtx, dst.width, dst.height);
+            const tilt = estimateTilt(dst);
+            out = deskew(dst, tilt);
+        }
 
         // Mirror result to the debug preview canvas
-        ocrPreview.width  = corrected.width;
-        ocrPreview.height = corrected.height;
-        ocrPreview.getContext('2d').drawImage(corrected, 0, 0);
+        ocrPreview.width  = out.width;
+        ocrPreview.height = out.height;
+        ocrPreview.getContext('2d').drawImage(out, 0, 0);
 
-        return corrected.toDataURL('image/png');
+        return out.toDataURL('image/png');
     }
 
     // ── Tesseract worker (persistent, initialised once) ──────────────────────
@@ -272,9 +272,10 @@
     async function initWorker() {
         worker = await Tesseract.createWorker('eng');
         await worker.setParameters({
-            tessedit_char_whitelist: 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789<',
-            // PSM 11 = sparse text — finds text anywhere in the full frame
-            tessedit_pageseg_mode: '11',
+            // No character whitelist — Tesseract 4 LSTM ignores it and returns
+            // nothing. Post-processing (cleanLine) handles the filtering instead.
+            // PSM 3 = auto page segmentation, handles mixed passport content well.
+            tessedit_pageseg_mode: '3',
         });
     }
 
