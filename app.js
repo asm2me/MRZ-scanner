@@ -142,7 +142,13 @@
     let worker = null;
 
     async function initWorker() {
+        // Use locally-hosted vendor files to avoid CDN CORB issues.
+        // corePath must be an absolute URL so it resolves correctly from a blob worker.
+        const base = new URL('.', window.location.href).href.replace(/\/$/, '');
         worker = await Tesseract.createWorker('eng', 1, {
+            workerPath: base + '/vendor/worker.min.js',
+            corePath:   base + '/vendor/core',
+            langPath:   'https://tessdata.projectnaptha.com/4.0.0/',
             logger: m => {
                 if (m.status === 'loading tesseract core')
                     message.textContent = 'Loading OCR engine…';
@@ -189,8 +195,7 @@
         if (!worker) return null;
 
         const strip = captureMRZStrip();
-        const imgData = strip.getContext('2d').getImageData(0, 0, strip.width, strip.height);
-        const { data: { text } } = await worker.recognize(imgData);
+        const { data: { text } } = await worker.recognize(strip);
 
         ocrText.textContent = text || '(empty)';
         console.log('[MRZ raw]', JSON.stringify(text));

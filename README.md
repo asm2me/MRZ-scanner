@@ -12,14 +12,33 @@ This simple web application uses the webcam to scan the Machine Readable Zone (M
 
 ## Running locally
 
-Just open `index.html` in your browser. Some browsers require a secure context to access the camera, so you may need to serve the folder over HTTP. For example:
+**⚠️ You must serve the files over HTTP — do not open `index.html` directly from the filesystem.**
+Browsers block WASM loading inside web workers when the page is loaded via `file://`, which breaks the OCR engine.
 
+Pick any option:
+
+**Option 1 — Node.js (npx, no install needed)**
 ```powershell
-# from the project root
-python -m http.server 8000
+npx serve .
+# then visit http://localhost:3000
 ```
 
-Then visit `http://localhost:8000` and allow camera access; the page will start scanning.
+**Option 2 — Node.js http-server**
+```powershell
+npx http-server . -p 8000
+# then visit http://localhost:8000
+```
+
+**Option 3 — Python (if available)**
+```powershell
+python -m http.server 8000
+# then visit http://localhost:8000
+```
+
+**Option 4 — VS Code**
+Install the [Live Server](https://marketplace.visualstudio.com/items?itemName=ritwickdey.LiveServer) extension, right-click `index.html` → "Open with Live Server".
+
+Allow camera access when prompted; the page will start scanning automatically.
 
 ⚠️ For best results, hold the passport MRZ area clear and well-lit. Scanning may take a few seconds.
 
