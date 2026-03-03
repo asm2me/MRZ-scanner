@@ -1,4 +1,5 @@
 (function () {
+    /* ── DOM ──────────────────────────────────────────────────────────────── */
     const video          = document.getElementById('video');
     const canvas         = document.getElementById('canvas');
     const overlay        = document.getElementById('overlay');
@@ -16,44 +17,38 @@
     const ctx            = canvas.getContext('2d');
     const ovCtx          = overlay.getContext('2d');
 
-    // ── Passport layout (fractions of displayed/video dimensions) ───────────
-    // TD-3 passport: 125 mm × 88 mm → aspect ratio 125/88
+    /* ── Passport guide proportions (TD-3: 125 mm × 88 mm) ───────────────── */
     const P = {
         xFrac : 0.04,
         wFrac : 0.92,
         get hFrac() { return this.wFrac * (88 / 125); },
         get yFrac()  { return 0.5 - this.hFrac / 2; },
-        // MRZ zone — 27 % of passport height gives a comfortable buffer
-        mrzFrac: 0.27,
+        mrzFrac: 0.27,   // MRZ = bottom 27 % of passport height
     };
 
-    // ── Overlay drawing ─────────────────────────────────────────────────────
+    /* ── Overlay ──────────────────────────────────────────────────────────── */
     function drawOverlay() {
-        const W = overlay.width;
-        const H = overlay.height;
+        const W = overlay.width, H = overlay.height;
         if (!W || !H) return;
 
-        const px   = P.xFrac  * W;
-        const py   = P.yFrac  * H;
-        const pw   = P.wFrac  * W;
-        const ph   = P.hFrac  * H;
-        const mrzH = P.mrzFrac * ph;
-        const mrzY = py + ph - mrzH;
+        const px = P.xFrac * W, py = P.yFrac * H;
+        const pw = P.wFrac * W, ph = P.hFrac * H;
+        const mrzH = P.mrzFrac * ph, mrzY = py + ph - mrzH;
 
         ovCtx.clearRect(0, 0, W, H);
 
-        // Dark vignette outside the passport cutout
+        // dark vignette outside the passport cutout
         ovCtx.fillStyle = 'rgba(0,0,0,0.55)';
         ovCtx.beginPath();
         ovCtx.rect(0, 0, W, H);
-        ovCtx.rect(px, py, pw, ph);  // counter-clockwise hole
+        ovCtx.rect(px, py, pw, ph);
         ovCtx.fill('evenodd');
 
         // MRZ highlight band
         ovCtx.fillStyle = 'rgba(0,180,255,0.18)';
         ovCtx.fillRect(px, mrzY, pw, mrzH);
 
-        // Dashed separator above MRZ
+        // dashed separator above MRZ
         ovCtx.save();
         ovCtx.setLineDash([6, 4]);
         ovCtx.strokeStyle = 'rgba(0,180,255,0.75)';
@@ -64,36 +59,33 @@
         ovCtx.stroke();
         ovCtx.restore();
 
-        // Passport border
+        // passport border
         ovCtx.strokeStyle = 'rgba(255,255,255,0.7)';
         ovCtx.lineWidth = 1.5;
         ovCtx.strokeRect(px, py, pw, ph);
 
-        // Corner brackets
+        // corner brackets
         const bLen = Math.min(pw, ph) * 0.075;
         ovCtx.strokeStyle = '#00b4ff';
         ovCtx.lineWidth = 3;
         ovCtx.lineCap = 'square';
-        [[px,      py,      1,  1],
-         [px + pw, py,     -1,  1],
-         [px,      py + ph, 1, -1],
-         [px + pw, py + ph,-1, -1]].forEach(([cx, cy, dx, dy]) => {
-            ovCtx.beginPath();
-            ovCtx.moveTo(cx + dx * bLen, cy);
-            ovCtx.lineTo(cx, cy);
-            ovCtx.lineTo(cx, cy + dy * bLen);
-            ovCtx.stroke();
-        });
+        [[px, py, 1, 1], [px + pw, py, -1, 1], [px, py + ph, 1, -1], [px + pw, py + ph, -1, -1]]
+            .forEach(([cx, cy, dx, dy]) => {
+                ovCtx.beginPath();
+                ovCtx.moveTo(cx + dx * bLen, cy);
+                ovCtx.lineTo(cx, cy);
+                ovCtx.lineTo(cx, cy + dy * bLen);
+                ovCtx.stroke();
+            });
 
-        // "MRZ" label centred in the MRZ band
-        const fs = Math.max(11, pw * 0.028);
-        ovCtx.font = `bold ${fs}px monospace`;
+        // "MRZ" label
+        ovCtx.font = `bold ${Math.max(11, pw * 0.028)}px monospace`;
         ovCtx.textAlign = 'center';
         ovCtx.textBaseline = 'middle';
         ovCtx.fillStyle = 'rgba(0,180,255,0.9)';
         ovCtx.fillText('MRZ', px + pw / 2, mrzY + mrzH / 2);
 
-        // Instruction above passport frame
+        // instruction above frame
         ovCtx.font = `${Math.max(11, W * 0.024)}px sans-serif`;
         ovCtx.fillStyle = 'rgba(255,255,255,0.85)';
         ovCtx.textBaseline = 'bottom';
@@ -106,189 +98,73 @@
         drawOverlay();
     }
 
-    // ── OCR crop: full camera frame so the document can be placed anywhere ───
-    function cropFrame() {
+    /* ── MRZ strip capture ────────────────────────────────────────────────── */
+    // Crops the MRZ band from the live video frame and scales it up 3× for OCR.
+    // No binarization: Tesseract's mrz model handles colour/greyscale natively.
+    function captureMRZStrip() {
         ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
         const W = canvas.width, H = canvas.height;
-        return { imgData: ctx.getImageData(0, 0, W, H), w: W, h: H };
-    }
 
-    // ── Image preprocessing: Otsu binarization + 4× upscale ────────────────
-    // Otsu's method finds the optimal threshold that maximises between-class
-    // variance → gives crisp black text / white background for Tesseract.
-    function otsuBinarize(dCtx, w, h) {
-        const id   = dCtx.getImageData(0, 0, w, h);
-        const d    = id.data;
-        const n    = w * h;
-        const gray = new Uint8Array(n);
-        const hist = new Int32Array(256);
+        const py   = P.yFrac  * H;
+        const ph   = P.hFrac  * H;
+        const mrzH = P.mrzFrac * ph;
+        const mrzY = py + ph - mrzH;
 
-        for (let i = 0; i < n; i++) {
-            const j = i * 4;
-            gray[i] = (0.299 * d[j] + 0.587 * d[j + 1] + 0.114 * d[j + 2]) | 0;
-            hist[gray[i]]++;
-        }
+        // Add 25 % vertical padding so slight vertical misalignment is tolerated
+        const padH = mrzH * 0.25;
+        const sy   = Math.max(0, Math.floor(mrzY - padH));
+        const sh   = Math.min(H - sy, Math.ceil(mrzH + padH * 2));
 
-        let sum = 0;
-        for (let i = 0; i < 256; i++) sum += i * hist[i];
+        const src = document.createElement('canvas');
+        src.width  = W;
+        src.height = sh;
+        src.getContext('2d').putImageData(ctx.getImageData(0, sy, W, sh), 0, 0);
 
-        let wB = 0, sumB = 0, maxVar = 0, thresh = 128;
-        for (let t = 0; t < 256; t++) {
-            wB += hist[t];
-            if (!wB) continue;
-            const wF = n - wB;
-            if (!wF) break;
-            sumB += t * hist[t];
-            const mB = sumB / wB;
-            const mF = (sum - sumB) / wF;
-            const v  = wB * wF * (mB - mF) ** 2;
-            if (v > maxVar) { maxVar = v; thresh = t; }
-        }
+        // 3× upscale — larger glyphs improve Tesseract classification accuracy
+        const SCALE = 3;
+        const dst   = document.createElement('canvas');
+        dst.width   = W * SCALE;
+        dst.height  = sh * SCALE;
+        const dCtx  = dst.getContext('2d');
+        dCtx.imageSmoothingEnabled  = true;
+        dCtx.imageSmoothingQuality  = 'high';
+        dCtx.drawImage(src, 0, 0, dst.width, dst.height);
 
-        // Dark text (≤ threshold) → black; light background → white
-        let blackCount = 0;
-        for (let i = 0; i < n; i++) {
-            const val = gray[i] <= thresh ? 0 : 255;
-            const j   = i * 4;
-            d[j] = d[j + 1] = d[j + 2] = val;
-            d[j + 3] = 255;
-            if (val === 0) blackCount++;
-        }
-        // If the majority is black the passport has a dark background —
-        // Tesseract needs black text on white, so invert.
-        if (blackCount > n * 0.5) {
-            for (let i = 0; i < n; i++) {
-                const j = i * 4;
-                d[j] = d[j + 1] = d[j + 2] = d[j] === 0 ? 255 : 0;
-            }
-        }
-        dCtx.putImageData(id, 0, 0);
-    }
+        // Mirror to the debug preview canvas
+        ocrPreview.width  = dst.width;
+        ocrPreview.height = dst.height;
+        ocrPreview.getContext('2d').drawImage(dst, 0, 0);
 
-    // ── Tilt detection (projection-profile, ±10° at 1° steps) ───────────────
-    // Works on a small downscaled copy for speed, returns degrees to correct.
-    function estimateTilt(binaryCanvas) {
-        const W = binaryCanvas.width, H = binaryCanvas.height;
-        const SW = Math.min(W, 200), SH = Math.round(H * SW / W);
-
-        const tmp  = document.createElement('canvas');
-        tmp.width  = SW; tmp.height = SH;
-        const tc   = tmp.getContext('2d');
-        tc.imageSmoothingEnabled = false;
-        tc.drawImage(binaryCanvas, 0, 0, SW, SH);
-
-        const d   = tc.getImageData(0, 0, SW, SH).data;
-        const bin = new Uint8Array(SW * SH);
-        let darkCount = 0;
-        for (let i = 0; i < SW * SH; i++) {
-            bin[i] = d[i * 4] < 128 ? 1 : 0;
-            darkCount += bin[i];
-        }
-        if (darkCount < SW * SH * 0.01) return 0; // not enough ink to judge
-
-        const cx = SW / 2, cy = SH / 2;
-        let bestAngle = 0, bestScore = -Infinity;
-        const profileLen = SH * 3;
-
-        for (let a = -10; a <= 10; a++) {
-            const rad = a * Math.PI / 180;
-            const cos = Math.cos(rad), sin = Math.sin(rad);
-            const profile = new Float32Array(profileLen);
-
-            for (let y = 0; y < SH; y++) {
-                for (let x = 0; x < SW; x++) {
-                    if (bin[y * SW + x]) {
-                        const ry = Math.round((y - cy) * cos - (x - cx) * sin + cy) + SH;
-                        if (ry >= 0 && ry < profileLen) profile[ry]++;
-                    }
-                }
-            }
-
-            let mean = 0;
-            for (const v of profile) mean += v;
-            mean /= profileLen;
-            let score = 0;
-            for (const v of profile) score += (v - mean) ** 2;
-
-            if (score > bestScore) { bestScore = score; bestAngle = a; }
-        }
-        return bestAngle;
-    }
-
-    // Rotate canvas by angleDeg to level the text lines.
-    function deskew(srcCanvas, angleDeg) {
-        if (Math.abs(angleDeg) < 1) return srcCanvas;
-        const w = srcCanvas.width, h = srcCanvas.height;
-        const dst = document.createElement('canvas');
-        dst.width = w; dst.height = h;
-        const dc  = dst.getContext('2d');
-        dc.fillStyle = 'white';
-        dc.fillRect(0, 0, w, h);
-        dc.save();
-        dc.translate(w / 2, h / 2);
-        dc.rotate(-angleDeg * Math.PI / 180);
-        dc.drawImage(srcCanvas, -w / 2, -h / 2);
-        dc.restore();
         return dst;
     }
 
-    // binarize=true for tight MRZ crop; false for full-frame (global Otsu
-    // threshold destroys text when background dominates the image).
-    function toDataURL({ imgData, w, h }, binarize = false) {
-        const src = document.createElement('canvas');
-        src.width = w; src.height = h;
-        src.getContext('2d').putImageData(imgData, 0, 0);
-
-        // No upscale for full frame (already large); 3× for a tight crop.
-        const scale = binarize ? 3 : 1;
-        const dst   = document.createElement('canvas');
-        dst.width   = w * scale;
-        dst.height  = h * scale;
-        const dCtx  = dst.getContext('2d');
-        dCtx.imageSmoothingEnabled = true;
-        dCtx.imageSmoothingQuality = 'high';
-        if (binarize) dCtx.filter = 'blur(1px)';
-        dCtx.drawImage(src, 0, 0, dst.width, dst.height);
-        dCtx.filter = 'none';
-
-        let out = dst;
-        if (binarize) {
-            otsuBinarize(dCtx, dst.width, dst.height);
-            const tilt = estimateTilt(dst);
-            out = deskew(dst, tilt);
-        }
-
-        // Mirror result to the debug preview canvas
-        ocrPreview.width  = out.width;
-        ocrPreview.height = out.height;
-        ocrPreview.getContext('2d').drawImage(out, 0, 0);
-
-        return out.toDataURL('image/png');
-    }
-
-    // ── Tesseract worker (persistent, initialised once) ──────────────────────
+    /* ── Tesseract worker ─────────────────────────────────────────────────── */
     let worker = null;
 
     async function initWorker() {
-        worker = await Tesseract.createWorker('eng');
+        worker = await Tesseract.createWorker('eng', 1, {
+            logger: m => {
+                if (m.status === 'loading tesseract core')
+                    message.textContent = 'Loading OCR engine…';
+                if (m.status === 'loading language traineddata')
+                    message.textContent = 'Loading OCR model…';
+            },
+        });
         await worker.setParameters({
-            // No character whitelist — Tesseract 4 LSTM ignores it and returns
-            // nothing. Post-processing (cleanLine) handles the filtering instead.
-            // PSM 3 = auto page segmentation, handles mixed passport content well.
-            tessedit_pageseg_mode: '3',
+            tessedit_pageseg_mode: '6',   // single uniform block of text
         });
     }
 
-    // ── Line cleaning: replace common OCR artefacts of '<' rather than delete─
+    /* ── Line cleaning ────────────────────────────────────────────────────── */
+    // Maps common OCR misreads of '<' back to '<', then strips everything else.
     function cleanLine(raw) {
         return raw
             .toUpperCase()
-            // Chars that Tesseract commonly returns instead of '<'
             .replace(/[\s\-_«»(){}\[\]|\\\/.,;:'"]/g, '<')
-            .replace(/[^A-Z0-9<]/g, '');  // remove anything else
+            .replace(/[^A-Z0-9<]/g, '');
     }
 
-    // ── Debug: show parsed fields table ─────────────────────────────────────
+    /* ── Debug fields table ───────────────────────────────────────────────── */
     function showDebugFields(parsed) {
         if (!parsed || !parsed.fields) { ocrFields.style.display = 'none'; return; }
         const LABELS = {
@@ -308,16 +184,16 @@
         ocrFields.style.display = 'block';
     }
 
-    // ── MRZ recognition ──────────────────────────────────────────────────────
+    /* ── MRZ recognition ──────────────────────────────────────────────────── */
     async function recognizeMRZ() {
         if (!worker) return null;
 
-        const crop    = cropFrame();
-        const dataUrl = toDataURL(crop);
-        const { data: { text } } = await worker.recognize(dataUrl);
+        const strip = captureMRZStrip();
+        const imgData = strip.getContext('2d').getImageData(0, 0, strip.width, strip.height);
+        const { data: { text } } = await worker.recognize(imgData);
 
         ocrText.textContent = text || '(empty)';
-        console.log('[MRZ OCR raw]', JSON.stringify(text));
+        console.log('[MRZ raw]', JSON.stringify(text));
 
         const lines = text
             .split(/[\r\n]+/)
@@ -328,7 +204,7 @@
             ? lines.join('\n')
             : '(no candidate lines found)';
 
-        let bestResult = null;
+        let best = null;
 
         for (let i = 0; i < lines.length; i++) {
             // TD-3 passport: 2 lines × 44 chars
@@ -337,29 +213,31 @@
                 if (g2[0].length >= 35 && g2[1].length >= 35) {
                     try {
                         const r = MRZ.parse(g2);
-                        if (r) { if (!bestResult) bestResult = r; if (r.valid) { bestResult = r; break; } }
+                        if (r) { if (!best) best = r; if (r.valid) { best = r; break; } }
                     } catch (e) {}
                 }
             }
             // TD-1 ID card: 3 lines × 30 chars
             if (i + 2 < lines.length) {
-                const g3 = [lines[i].slice(0, 30), lines[i + 1].slice(0, 30), lines[i + 2].slice(0, 30)];
+                const g3 = [
+                    lines[i    ].slice(0, 30),
+                    lines[i + 1].slice(0, 30),
+                    lines[i + 2].slice(0, 30),
+                ];
                 if (g3[0].length >= 24) {
                     try {
                         const r = MRZ.parse(g3);
-                        if (r) { if (!bestResult) bestResult = r; if (r.valid) { bestResult = r; break; } }
+                        if (r) { if (!best) best = r; if (r.valid) { best = r; break; } }
                     } catch (e) {}
                 }
             }
         }
 
-        showDebugFields(bestResult);
-        return (bestResult && bestResult.valid) ? bestResult : null;
+        showDebugFields(best);
+        return (best && best.valid) ? best : null;
     }
 
-    // ── Beep on successful scan ──────────────────────────────────────────────
-    // A single shared AudioContext avoids the autoplay-policy issue: once the
-    // user interacts with the page it is resumed and stays alive.
+    /* ── Beep ─────────────────────────────────────────────────────────────── */
     let _audioCtx = null;
     function getAudioCtx() {
         if (!_audioCtx) _audioCtx = new (window.AudioContext || window.webkitAudioContext)();
@@ -369,7 +247,6 @@
         const ac = getAudioCtx();
         if (ac.state === 'suspended') ac.resume();
     });
-
     function playBeep() {
         try {
             const ac = getAudioCtx();
@@ -382,7 +259,7 @@
         } catch (e) {}
     }
 
-    // ── Scan loop ────────────────────────────────────────────────────────────
+    /* ── Scan loop ────────────────────────────────────────────────────────── */
     let lastScan = 0, busy = false;
 
     async function scanFrame() {
@@ -402,21 +279,20 @@
                     return;
                 } else {
                     message.textContent = worker
-                        ? 'No valid MRZ found — point camera at the passport'
+                        ? 'No valid MRZ found — align passport with the guide'
                         : 'Initializing OCR engine…';
                 }
             } catch (e) {
                 console.error(e);
-                message.textContent = 'No valid MRZ found — point camera at the passport';
+                message.textContent = 'OCR error: ' + (e?.message || String(e));
             }
             busy = false;
         }
         requestAnimationFrame(scanFrame);
     }
 
-    // ── Focus controls ───────────────────────────────────────────────────────
+    /* ── Focus controls ───────────────────────────────────────────────────── */
     let videoTrack = null;
-
     const MODE_LABELS = { continuous: 'Auto', locked: 'Lock', manual: 'Manual' };
 
     async function applyFocusMode(mode) {
@@ -424,9 +300,7 @@
         try {
             await videoTrack.applyConstraints({ advanced: [{ focusMode: mode }] });
             focusDistRow.style.display = mode === 'manual' ? 'flex' : 'none';
-        } catch (e) {
-            console.warn('focusMode constraint failed:', e);
-        }
+        } catch (e) { console.warn('focusMode constraint failed:', e); }
     }
 
     async function applyFocusDistance(value) {
@@ -435,17 +309,14 @@
             await videoTrack.applyConstraints({
                 advanced: [{ focusMode: 'manual', focusDistance: value }],
             });
-        } catch (e) {
-            console.warn('focusDistance constraint failed:', e);
-        }
+        } catch (e) { console.warn('focusDistance constraint failed:', e); }
     }
 
     function setupFocusControls(caps) {
-        // Build mode options from what the camera actually supports
         const supportedModes = caps.focusMode || [];
         const wantedOrder = ['continuous', 'locked', 'manual'];
         const available = wantedOrder.filter(m => supportedModes.includes(m));
-        if (available.length < 2) return; // nothing useful to show
+        if (available.length < 2) return;
 
         available.forEach(m => {
             const opt = document.createElement('option');
@@ -454,19 +325,15 @@
             focusModeSelect.appendChild(opt);
         });
 
-        // Distance slider — only if camera exposes focusDistance range
         if (available.includes('manual') && caps.focusDistance) {
             const fd = caps.focusDistance;
             focusRange.min  = fd.min;
             focusRange.max  = fd.max;
             focusRange.step = fd.step || (fd.max - fd.min) / 100;
-
-            // Restore saved distance or default to infinity (fd.max)
             const savedDist = parseFloat(localStorage.getItem('focusDistance'));
             const initDist  = (savedDist >= fd.min && savedDist <= fd.max) ? savedDist : fd.max;
-            focusRange.value        = initDist;
-            focusVal.textContent    = initDist.toFixed(2) + ' m';
-
+            focusRange.value     = initDist;
+            focusVal.textContent = initDist.toFixed(2) + ' m';
             focusRange.addEventListener('input', () => {
                 const v = parseFloat(focusRange.value);
                 focusVal.textContent = v.toFixed(2) + ' m';
@@ -479,7 +346,6 @@
                 applyFocusDistance(v);
             });
         } else if (available.includes('manual')) {
-            // manual mode supported but no distance range — remove the option
             const manualOpt = focusModeSelect.querySelector('[value="manual"]');
             if (manualOpt) manualOpt.remove();
         }
@@ -490,7 +356,6 @@
             applyFocusMode(mode);
         });
 
-        // Restore last-used focus mode (and distance when manual)
         const saved = localStorage.getItem('focusMode');
         if (saved && available.includes(saved)) {
             focusModeSelect.value = saved;
@@ -505,41 +370,35 @@
         focusControls.style.display = 'flex';
     }
 
-    // ── Camera permission + start ────────────────────────────────────────────
+    /* ── Camera ───────────────────────────────────────────────────────────── */
     async function getCameraPermissionState() {
         if (!navigator.permissions) return 'unknown';
         try {
             const s = await navigator.permissions.query({ name: 'camera' });
-            return s.state; // 'granted' | 'prompt' | 'denied'
+            return s.state;
         } catch (e) { return 'unknown'; }
     }
 
     async function startCamera() {
         const permState = await getCameraPermissionState();
-
         if (permState === 'denied') {
             message.textContent = 'Camera blocked. Open browser Settings → Privacy → Camera and allow this site.';
             return;
         }
-
         try {
             const stream = await navigator.mediaDevices.getUserMedia({
                 video: { facingMode: 'environment', width: { ideal: 1280 }, height: { ideal: 720 } },
             });
-
-            // Show a one-time tip the first time the user is prompted
             if (permState === 'prompt') {
                 permTip.textContent =
                     'Tip: click the camera icon in the address bar and choose "Always allow" to skip this prompt next time.';
                 permTip.style.display = 'block';
                 setTimeout(() => { permTip.style.display = 'none'; }, 10000);
             }
-
             video.srcObject = stream;
             videoTrack = stream.getVideoTracks()[0];
             const caps = videoTrack.getCapabilities ? videoTrack.getCapabilities() : {};
             setupFocusControls(caps);
-
             video.addEventListener('loadedmetadata', () => {
                 canvas.width  = video.videoWidth;
                 canvas.height = video.videoHeight;
@@ -555,15 +414,17 @@
         }
     }
 
-    // ── Boot ─────────────────────────────────────────────────────────────────
+    /* ── Boot ─────────────────────────────────────────────────────────────── */
     new ResizeObserver(resizeOverlay).observe(video);
     window.addEventListener('resize', resizeOverlay);
 
-    // Start camera and OCR init in parallel
     startCamera();
     initWorker().then(() => {
         if (message.textContent === 'Initializing…') {
             message.textContent = 'Align passport within the guide';
         }
+    }).catch(e => {
+        console.error('Worker init failed:', e);
+        message.textContent = 'OCR init error: ' + e.message;
     });
 })();
