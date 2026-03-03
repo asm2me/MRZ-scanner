@@ -15,59 +15,18 @@
     const ocrFields      = document.getElementById('ocr-fields');
     const ovCtx          = overlay.getContext('2d');
 
-    /* ── Passport guide proportions (TD-3: 125 mm × 88 mm) ───────────────── */
-    const P = {
-        xFrac : 0.04,
-        wFrac : 0.92,
-        get hFrac() { return this.wFrac * (88 / 125); },
-        get yFrac()  { return 0.5 - this.hFrac / 2; },
-        mrzFrac: 0.27,   // MRZ = bottom 27 % of passport height
-    };
-
     /* ── Overlay ──────────────────────────────────────────────────────────── */
     function drawOverlay() {
         const W = overlay.width, H = overlay.height;
         if (!W || !H) return;
-
-        const px = P.xFrac * W, py = P.yFrac * H;
-        const pw = P.wFrac * W, ph = P.hFrac * H;
-        const mrzH = P.mrzFrac * ph, mrzY = py + ph - mrzH;
-
         ovCtx.clearRect(0, 0, W, H);
 
-        // dark vignette outside the passport cutout
-        ovCtx.fillStyle = 'rgba(0,0,0,0.55)';
-        ovCtx.beginPath();
-        ovCtx.rect(0, 0, W, H);
-        ovCtx.rect(px, py, pw, ph);
-        ovCtx.fill('evenodd');
-
-        // MRZ highlight band
-        ovCtx.fillStyle = 'rgba(0,180,255,0.18)';
-        ovCtx.fillRect(px, mrzY, pw, mrzH);
-
-        // dashed separator above MRZ
-        ovCtx.save();
-        ovCtx.setLineDash([6, 4]);
-        ovCtx.strokeStyle = 'rgba(0,180,255,0.75)';
-        ovCtx.lineWidth = 1.5;
-        ovCtx.beginPath();
-        ovCtx.moveTo(px, mrzY);
-        ovCtx.lineTo(px + pw, mrzY);
-        ovCtx.stroke();
-        ovCtx.restore();
-
-        // passport border
-        ovCtx.strokeStyle = 'rgba(255,255,255,0.7)';
-        ovCtx.lineWidth = 1.5;
-        ovCtx.strokeRect(px, py, pw, ph);
-
-        // corner brackets
-        const bLen = Math.min(pw, ph) * 0.075;
+        // corner brackets — indicate scanning the whole view
+        const m = 14, bLen = Math.min(W, H) * 0.07;
         ovCtx.strokeStyle = '#00b4ff';
-        ovCtx.lineWidth = 3;
-        ovCtx.lineCap = 'square';
-        [[px, py, 1, 1], [px + pw, py, -1, 1], [px, py + ph, 1, -1], [px + pw, py + ph, -1, -1]]
+        ovCtx.lineWidth   = 3;
+        ovCtx.lineCap     = 'square';
+        [[m, m, 1, 1], [W - m, m, -1, 1], [m, H - m, 1, -1], [W - m, H - m, -1, -1]]
             .forEach(([cx, cy, dx, dy]) => {
                 ovCtx.beginPath();
                 ovCtx.moveTo(cx + dx * bLen, cy);
@@ -76,18 +35,12 @@
                 ovCtx.stroke();
             });
 
-        // "MRZ" label
-        ovCtx.font = `bold ${Math.max(11, pw * 0.028)}px monospace`;
-        ovCtx.textAlign = 'center';
-        ovCtx.textBaseline = 'middle';
-        ovCtx.fillStyle = 'rgba(0,180,255,0.9)';
-        ovCtx.fillText('MRZ', px + pw / 2, mrzY + mrzH / 2);
-
-        // instruction above frame
-        ovCtx.font = `${Math.max(11, W * 0.024)}px sans-serif`;
-        ovCtx.fillStyle = 'rgba(255,255,255,0.85)';
+        // instruction
+        ovCtx.font         = `${Math.max(11, W * 0.022)}px sans-serif`;
+        ovCtx.textAlign    = 'center';
         ovCtx.textBaseline = 'bottom';
-        ovCtx.fillText('Align MRZ strip with the blue band below', W / 2, py - 8);
+        ovCtx.fillStyle    = 'rgba(255,255,255,0.85)';
+        ovCtx.fillText('Point camera at passport MRZ — scanning whole view', W / 2, H - m);
     }
 
     function resizeOverlay() {
@@ -200,42 +153,105 @@
         return dst;
     }
 
+    /* ── MRZ-band locator ───────────────────────────────────────────────────── */
+    // Downsamples the full camera frame to a 480-px-wide thumbnail, computes a
+    // horizontal row-density profile, and returns the y-range (in video pixels)
+    // of the densest text band — most likely the MRZ — or null if nothing stands out.
+    function findMRZBand() {
+        const vW = video.videoWidth, vH = video.videoHeight;
+        const tScale = Math.min(1, 480 / vW);
+        const tW = Math.round(vW * tScale), tH = Math.round(vH * tScale);
+
+        const tc = document.createElement('canvas');
+        tc.width = tW; tc.height = tH;
+        const tCtx = tc.getContext('2d');
+        tCtx.drawImage(video, 0, 0, tW, tH);
+        const d = tCtx.getImageData(0, 0, tW, tH).data;
+
+        // Row density: fraction of dark pixels (luma < 130) per row
+        const density = new Float32Array(tH);
+        for (let y = 0; y < tH; y++) {
+            let dark = 0;
+            for (let x = 0; x < tW; x++) {
+                const i = (y * tW + x) * 4;
+                if ((d[i] * 77 + d[i + 1] * 150 + d[i + 2] * 29) >> 8 < 130) dark++;
+            }
+            density[y] = dark / tW;
+        }
+
+        // Smooth with a 9-px half-window to bridge inter-line gaps
+        const smooth = new Float32Array(tH);
+        for (let y = 0; y < tH; y++) {
+            let s = 0, n = 0;
+            for (let dy = -9; dy <= 9; dy++) {
+                const yy = y + dy;
+                if (yy >= 0 && yy < tH) { s += density[yy]; n++; }
+            }
+            smooth[y] = s / n;
+        }
+
+        // Adaptive threshold: global mean × 2.5, clamped
+        let mean = 0;
+        for (let y = 0; y < tH; y++) mean += smooth[y];
+        mean /= tH;
+        const thresh = Math.max(0.06, Math.min(0.35, mean * 2.5));
+
+        // Find the highest-scoring contiguous run above threshold
+        let bestY1 = -1, bestY2 = -1, bestScore = 0;
+        let runY1 = -1, runScore = 0;
+        for (let y = 0; y <= tH; y++) {
+            if (y < tH && smooth[y] >= thresh) {
+                if (runY1 < 0) { runY1 = y; runScore = 0; }
+                runScore += smooth[y];
+            } else if (runY1 >= 0) {
+                if (runScore > bestScore) {
+                    bestScore = runScore;
+                    bestY1 = runY1;
+                    bestY2 = y - 1;
+                }
+                runY1 = -1;
+            }
+        }
+
+        if (bestY1 < 0) return null;
+        return {
+            y1: Math.max(0, Math.round(bestY1 / tScale)),
+            y2: Math.min(vH - 1, Math.round(bestY2 / tScale)),
+        };
+    }
+
     /* ── MRZ-region capture ────────────────────────────────────────────────── */
-    // Crops to the MRZ band, 2× upscales, adaptive-thresholds, detects + corrects
-    // skew via projection profile, then returns the clean B&W canvas for OCR.
-    // 2× (not 3×) keeps pixel count low → fast PSM=6 OCR.
+    // Locates the MRZ band anywhere in the full camera frame via row-density
+    // projection, then crops, upscales (capped at 2048 px wide), adaptive-
+    // thresholds, and skew-corrects the strip before handing it to Tesseract.
     function captureFrame() {
         const vW = video.videoWidth, vH = video.videoHeight;
         if (!vW || !vH) return null;
 
-        // Guide-relative MRZ bounds in video-pixel space
-        const gX = P.xFrac * vW;
-        const gY = P.yFrac * vH;
-        const gW = P.wFrac * vW;
-        const gH = P.hFrac * vH;
+        // Auto-locate the MRZ band anywhere in the full frame
+        const band = findMRZBand();
+        let vy1, vy2;
+        if (band) {
+            const padPx = Math.round((band.y2 - band.y1 + 1) * 0.8);
+            vy1 = Math.max(0, band.y1 - padPx);
+            vy2 = Math.min(vH - 1, band.y2 + padPx);
+        } else {
+            vy1 = Math.floor(vH * 0.6);   // fallback: bottom 40 %
+            vy2 = vH - 1;
+        }
 
-        const mrzH = gH * P.mrzFrac;
-        const padV = mrzH * 0.8;   // 80 % extra height above MRZ baseline for tilt tolerance
-        const padH = gW * 0.03;    // 3 % extra width each side
-
-        const cx = Math.max(0, Math.floor(gX - padH));
-        const cy = Math.max(0, Math.floor(gY + gH - mrzH - padV));
-        const cw = Math.min(vW - cx, Math.ceil(gW + padH * 2));
-        const ch = Math.min(vH - cy, Math.ceil(mrzH + padV + mrzH * 0.1));
-
-        // 2× upscale — sufficient glyph size, ~40 % fewer pixels than 3× → faster
-        const scale = 2;
+        // Upscale crop — full width, capped at 2048 px to limit memory
+        const scale = Math.min(2, 2048 / vW);
+        const ch = vy2 - vy1 + 1;
         const dst = document.createElement('canvas');
-        dst.width  = Math.round(cw * scale);
-        dst.height = Math.round(ch * scale);
+        dst.width  = Math.round(vW * scale);
+        dst.height = Math.round(ch  * scale);
         const dCtx = dst.getContext('2d');
         dCtx.imageSmoothingEnabled = true;
         dCtx.imageSmoothingQuality = 'high';
-        dCtx.drawImage(video, cx, cy, cw, ch, 0, 0, dst.width, dst.height);
+        dCtx.drawImage(video, 0, vy1, vW, ch, 0, 0, dst.width, dst.height);
 
         adaptiveThreshold(dst);
-
-        // Our own skew correction — more reliable than PSM=3 on a 2-line strip
         const skew = estimateSkew(dst);
         const corrected = rotateCanvas(dst, skew);
 
@@ -266,7 +282,8 @@
             },
         });
         await worker.setParameters({
-            tessedit_pageseg_mode: '6',   // single uniform text block — faster; skew handled by rotateCanvas
+            tessedit_pageseg_mode:    '6',  // single uniform text block; skew handled by rotateCanvas
+            tessedit_char_whitelist:  'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789<',  // MRZ chars only → faster
         });
     }
 
@@ -382,7 +399,7 @@
 
     async function scanFrame() {
         const now = Date.now();
-        if (!busy && now - lastScan > 500) {
+        if (!busy && now - lastScan > 300) {
             lastScan = now;
             busy = true;
             if (worker) message.textContent = 'Scanning…';
@@ -396,7 +413,7 @@
                     return;
                 } else {
                     message.textContent = worker
-                        ? 'No valid MRZ found — align passport with the guide'
+                        ? 'No valid MRZ found — hold passport steady in view'
                         : 'Initializing OCR engine…';
                 }
             } catch (e) {
