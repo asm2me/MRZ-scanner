@@ -153,11 +153,12 @@
         return dst;
     }
 
-    /* ── MRZ-band locator ───────────────────────────────────────────────────── */
-    // Downsamples the full camera frame to a 480-px-wide thumbnail, computes a
-    // horizontal row-density profile, and returns the y-range (in video pixels)
-    // of the densest text band — most likely the MRZ — or null if nothing stands out.
-    function findMRZBand() {
+    /* ── MRZ-rectangle locator ─────────────────────────────────────────────── */
+    // Downsamples the full camera frame to a 480-px-wide thumbnail, finds the
+    // densest horizontal text band (y-range) via row-density projection, then
+    // finds the horizontal extent (x-range) via column-density within that band.
+    // Returns {x1, y1, x2, y2} in video pixels, or null if nothing found.
+    function findMRZRect() {
         const vW = video.videoWidth, vH = video.videoHeight;
         const tScale = Math.min(1, 480 / vW);
         const tW = Math.round(vW * tScale), tH = Math.round(vH * tScale);
@@ -168,18 +169,18 @@
         tCtx.drawImage(video, 0, 0, tW, tH);
         const d = tCtx.getImageData(0, 0, tW, tH).data;
 
-        // Row density: fraction of dark pixels (luma < 130) per row
+        // Helper: luma < 130 = dark pixel
+        const isDark = (i) => (d[i] * 77 + d[i + 1] * 150 + d[i + 2] * 29) >> 8 < 130;
+
+        // Row density: fraction of dark pixels per row
         const density = new Float32Array(tH);
         for (let y = 0; y < tH; y++) {
             let dark = 0;
-            for (let x = 0; x < tW; x++) {
-                const i = (y * tW + x) * 4;
-                if ((d[i] * 77 + d[i + 1] * 150 + d[i + 2] * 29) >> 8 < 130) dark++;
-            }
+            for (let x = 0; x < tW; x++) if (isDark((y * tW + x) * 4)) dark++;
             density[y] = dark / tW;
         }
 
-        // Smooth with a 9-px half-window to bridge inter-line gaps
+        // Smooth rows with a 9-px half-window
         const smooth = new Float32Array(tH);
         for (let y = 0; y < tH; y++) {
             let s = 0, n = 0;
@@ -196,7 +197,7 @@
         mean /= tH;
         const thresh = Math.max(0.06, Math.min(0.35, mean * 2.5));
 
-        // Find the highest-scoring contiguous run above threshold
+        // Find the highest-scoring contiguous run above threshold (y-band)
         let bestY1 = -1, bestY2 = -1, bestScore = 0;
         let runY1 = -1, runScore = 0;
         for (let y = 0; y <= tH; y++) {
@@ -214,49 +215,108 @@
         }
 
         if (bestY1 < 0) return null;
+
+        // Column density within the detected y-band → find x-bounds
+        const bandH = bestY2 - bestY1 + 1;
+        const colDensity = new Float32Array(tW);
+        for (let x = 0; x < tW; x++) {
+            let dark = 0;
+            for (let y = bestY1; y <= bestY2; y++) if (isDark((y * tW + x) * 4)) dark++;
+            colDensity[x] = dark / bandH;
+        }
+
+        // Smooth columns with a 5-px half-window
+        const smoothCol = new Float32Array(tW);
+        for (let x = 0; x < tW; x++) {
+            let s = 0, n = 0;
+            for (let dx = -5; dx <= 5; dx++) {
+                const xx = x + dx;
+                if (xx >= 0 && xx < tW) { s += colDensity[xx]; n++; }
+            }
+            smoothCol[x] = s / n;
+        }
+
+        // Find leftmost / rightmost columns above 4% density
+        const colThresh = 0.04;
+        let tx1 = 0, tx2 = tW - 1;
+        for (let x = 0; x < tW; x++)        if (smoothCol[x] >= colThresh) { tx1 = x; break; }
+        for (let x = tW - 1; x >= 0; x--)   if (smoothCol[x] >= colThresh) { tx2 = x; break; }
+
         return {
+            x1: Math.max(0, Math.round(tx1 / tScale)),
             y1: Math.max(0, Math.round(bestY1 / tScale)),
+            x2: Math.min(vW - 1, Math.round(tx2 / tScale)),
             y2: Math.min(vH - 1, Math.round(bestY2 / tScale)),
         };
     }
 
+    /* ── Draw MRZ rectangle on overlay ─────────────────────────────────────── */
+    function drawMRZRect(rect) {
+        const vW = video.videoWidth, vH = video.videoHeight;
+        if (!vW || !vH) return;
+        const sx = overlay.width / vW, sy = overlay.height / vH;
+        const rx = rect.x1 * sx, ry = rect.y1 * sy;
+        const rw = (rect.x2 - rect.x1) * sx, rh = (rect.y2 - rect.y1) * sy;
+
+        // Green rectangle with rounded corners
+        ovCtx.strokeStyle = '#00ff88';
+        ovCtx.lineWidth   = 2;
+        ovCtx.lineJoin    = 'round';
+        ovCtx.strokeRect(rx, ry, rw, rh);
+
+        // Semi-transparent fill
+        ovCtx.fillStyle = 'rgba(0, 255, 136, 0.08)';
+        ovCtx.fillRect(rx, ry, rw, rh);
+    }
+
     /* ── MRZ-region capture ────────────────────────────────────────────────── */
-    // Locates the MRZ band anywhere in the full camera frame via row-density
-    // projection, then crops, upscales (capped at 2048 px wide), adaptive-
-    // thresholds, and skew-corrects the strip before handing it to Tesseract.
+    // Detects the MRZ rectangle, marks it on the overlay, then crops, upscales,
+    // adaptive-thresholds, and skew-corrects the region before handing to Tesseract.
     function captureFrame() {
         const vW = video.videoWidth, vH = video.videoHeight;
         if (!vW || !vH) return null;
 
-        // Auto-locate the MRZ band anywhere in the full frame
-        const band = findMRZBand();
-        let vy1, vy2;
-        if (band) {
-            const padPx = Math.round((band.y2 - band.y1 + 1) * 0.8);
-            vy1 = Math.max(0, band.y1 - padPx);
-            vy2 = Math.min(vH - 1, band.y2 + padPx);
+        // Detect the MRZ rectangle (x + y bounds)
+        const rect = findMRZRect();
+        lastMRZRect = rect;
+
+        // Redraw overlay brackets, then mark the detected rectangle
+        drawOverlay();
+        if (rect) drawMRZRect(rect);
+
+        let vx1, vy1, vx2, vy2;
+        if (rect) {
+            const bw = rect.x2 - rect.x1 + 1, bh = rect.y2 - rect.y1 + 1;
+            const padX = Math.round(bw * 0.05);
+            const padY = Math.round(bh * 0.1);
+            vx1 = Math.max(0, rect.x1 - padX);
+            vy1 = Math.max(0, rect.y1 - padY);
+            vx2 = Math.min(vW - 1, rect.x2 + padX);
+            vy2 = Math.min(vH - 1, rect.y2 + padY);
         } else {
+            vx1 = 0;
             vy1 = Math.floor(vH * 0.6);   // fallback: bottom 40 %
+            vx2 = vW - 1;
             vy2 = vH - 1;
         }
 
-        // Upscale crop — full width, capped at 2048 px to limit memory
-        const scale = Math.min(2, 2048 / vW);
-        const ch = vy2 - vy1 + 1;
+        // Upscale crop — capped at 2048 px wide to limit memory
+        const cropW = vx2 - vx1 + 1, cropH = vy2 - vy1 + 1;
+        const scale = Math.min(2, 2048 / cropW);
         const dst = document.createElement('canvas');
-        dst.width  = Math.round(vW * scale);
-        dst.height = Math.round(ch  * scale);
+        dst.width  = Math.round(cropW * scale);
+        dst.height = Math.round(cropH * scale);
         const dCtx = dst.getContext('2d');
         dCtx.imageSmoothingEnabled = true;
         dCtx.imageSmoothingQuality = 'high';
-        dCtx.drawImage(video, 0, vy1, vW, ch, 0, 0, dst.width, dst.height);
+        dCtx.drawImage(video, vx1, vy1, cropW, cropH, 0, 0, dst.width, dst.height);
 
         adaptiveThreshold(dst);
         const skew = estimateSkew(dst);
         const corrected = rotateCanvas(dst, skew);
 
-        // Debug preview capped at 640 px wide
-        const ps = Math.min(1, 640 / corrected.width);
+        // Debug preview capped at 1280 px wide
+        const ps = Math.min(1, 1280 / corrected.width);
         ocrPreview.width  = Math.round(corrected.width  * ps);
         ocrPreview.height = Math.round(corrected.height * ps);
         ocrPreview.getContext('2d').drawImage(corrected, 0, 0, ocrPreview.width, ocrPreview.height);
@@ -369,6 +429,89 @@
         return (best && best.valid) ? best : null;
     }
 
+    /* ── Color photo capture & enhancement ────────────────────────────────── */
+    function clamp255(v) { return v < 0 ? 0 : v > 255 ? 255 : v | 0; }
+
+    // Unsharp-mask sharpening via a 3×3 Laplacian blend
+    function sharpenCanvas(canvas, ctx) {
+        const W = canvas.width, H = canvas.height;
+        const src = ctx.getImageData(0, 0, W, H);
+        const dst = new ImageData(W, H);
+        const s = src.data, d = dst.data;
+        for (let y = 0; y < H; y++) {
+            for (let x = 0; x < W; x++) {
+                const i = (y * W + x) * 4;
+                if (y === 0 || y === H - 1 || x === 0 || x === W - 1) {
+                    d[i] = s[i]; d[i+1] = s[i+1]; d[i+2] = s[i+2]; d[i+3] = 255;
+                    continue;
+                }
+                for (let c = 0; c < 3; c++) {
+                    const v = 5 * s[i + c]
+                        - s[i - W * 4 + c] - s[i + W * 4 + c]
+                        - s[i - 4 + c]     - s[i + 4 + c];
+                    d[i + c] = clamp255(v);
+                }
+                d[i + 3] = 255;
+            }
+        }
+        ctx.putImageData(dst, 0, 0);
+    }
+
+    // Contrast + brightness boost, then sharpen
+    function enhanceColor(canvas, ctx) {
+        const W = canvas.width, H = canvas.height;
+        const id = ctx.getImageData(0, 0, W, H);
+        const d = id.data;
+        const contrast = 1.18, brightness = 10;
+        for (let i = 0; i < d.length; i += 4) {
+            d[i]   = clamp255((d[i]   - 128) * contrast + 128 + brightness);
+            d[i+1] = clamp255((d[i+1] - 128) * contrast + 128 + brightness);
+            d[i+2] = clamp255((d[i+2] - 128) * contrast + 128 + brightness);
+        }
+        ctx.putImageData(id, 0, 0);
+        sharpenCanvas(canvas, ctx);
+    }
+
+    // Grabs the current full-color video frame, scales it down, enhances it,
+    // draws the detected MRZ rectangle on top, and returns a base64 JPEG string.
+    function captureColorPhoto(mrzRect) {
+        const vW = video.videoWidth, vH = video.videoHeight;
+        if (!vW || !vH) return null;
+        const scale = Math.min(1, 800 / vW);
+        const cW = Math.round(vW * scale), cH = Math.round(vH * scale);
+        const canvas = document.createElement('canvas');
+        canvas.width = cW; canvas.height = cH;
+        const ctx = canvas.getContext('2d');
+        ctx.imageSmoothingEnabled = true;
+        ctx.imageSmoothingQuality = 'high';
+        ctx.drawImage(video, 0, 0, cW, cH);
+        enhanceColor(canvas, ctx);
+
+        // Draw MRZ region rectangle on the captured photo
+        if (mrzRect) {
+            const rx = mrzRect.x1 * scale, ry = mrzRect.y1 * scale;
+            const rw = (mrzRect.x2 - mrzRect.x1) * scale;
+            const rh = (mrzRect.y2 - mrzRect.y1) * scale;
+            // Semi-transparent green fill
+            ctx.fillStyle = 'rgba(0, 255, 136, 0.15)';
+            ctx.fillRect(rx, ry, rw, rh);
+            // Green border
+            ctx.strokeStyle = '#00ff88';
+            ctx.lineWidth   = Math.max(2, cW * 0.004);
+            ctx.lineJoin    = 'round';
+            ctx.strokeRect(rx, ry, rw, rh);
+            // "MRZ" label
+            const fontSize = Math.max(10, cW * 0.018);
+            ctx.font         = `bold ${fontSize}px sans-serif`;
+            ctx.textBaseline = 'bottom';
+            ctx.textAlign    = 'left';
+            ctx.fillStyle    = '#00ff88';
+            ctx.fillText('MRZ', rx + 4, ry - 3);
+        }
+
+        return canvas.toDataURL('image/jpeg', 0.88);
+    }
+
     /* ── Beep ─────────────────────────────────────────────────────────────── */
     let _audioCtx = null;
     function getAudioCtx() {
@@ -395,7 +538,7 @@
     }
 
     /* ── Scan loop ────────────────────────────────────────────────────────── */
-    let lastScan = 0, busy = false;
+    let lastScan = 0, busy = false, lastMRZRect = null;
 
     async function scanFrame() {
         const now = Date.now();
@@ -408,7 +551,9 @@
                 if (parsed && parsed.valid) {
                     message.textContent = 'MRZ detected — redirecting…';
                     playBeep();
-                    sessionStorage.setItem('mrzData', JSON.stringify(parsed.fields));
+                    sessionStorage.setItem('mrzData', JSON.stringify({ fields: parsed.fields, valid: parsed.valid }));
+                    const photo = captureColorPhoto(lastMRZRect);
+                    if (photo) sessionStorage.setItem('personPhoto', photo);
                     setTimeout(() => { window.location.href = 'result.html'; }, 350);
                     return;
                 } else {
@@ -521,7 +666,7 @@
         }
         try {
             const stream = await navigator.mediaDevices.getUserMedia({
-                video: { facingMode: 'environment', width: { ideal: 640 }, height: { ideal: 480 } },
+                video: { facingMode: 'environment', width: { ideal: 1280 }, height: { ideal: 720 } },
             });
             if (permState === 'prompt') {
                 permTip.textContent =

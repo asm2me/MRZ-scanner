@@ -5,44 +5,302 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>MRZ Result</title>
     <style>
-        body { font-family: sans-serif; padding: 2rem; }
-        label { display: block; margin-top: 1rem; }
-        input { width: 100%; padding: .5rem; }
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body {
+            font-family: sans-serif;
+            background: #111827;
+            color: #e5e7eb;
+            min-height: 100vh;
+            padding: 1.5rem;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+        }
+        h1 {
+            font-size: 1.4rem;
+            letter-spacing: 0.05em;
+            color: #f9fafb;
+            margin-bottom: 1.25rem;
+        }
+        .card {
+            width: 100%;
+            max-width: 680px;
+            background: #1f2937;
+            border: 1px solid #374151;
+            border-radius: 12px;
+            overflow: hidden;
+            box-shadow: 0 4px 24px rgba(0,0,0,0.4);
+        }
+        /* ── Annotated passport image ── */
+        .passport-image {
+            width: 100%;
+            background: #0f172a;
+            border-bottom: 1px solid #374151;
+            display: none;
+        }
+        .passport-image img {
+            width: 100%;
+            display: block;
+        }
+        .passport-image .label {
+            padding: 0.35rem 0.75rem;
+            font-size: 0.72rem;
+            color: #6b7280;
+            text-transform: uppercase;
+            letter-spacing: 0.06em;
+            background: #111827;
+        }
+        /* ── Photo banner ── */
+        .photo-banner {
+            display: flex;
+            align-items: center;
+            gap: 1.25rem;
+            padding: 1.25rem 1.5rem;
+            background: #111827;
+            border-bottom: 1px solid #374151;
+        }
+        #photo-frame {
+            flex-shrink: 0;
+            width: 110px;
+            height: 140px;
+            border-radius: 8px;
+            border: 2px solid #00b4ff;
+            background: #0f172a;
+            overflow: hidden;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+        #photo-frame img {
+            width: 100%;
+            height: 100%;
+            object-fit: cover;
+            display: block;
+            filter: contrast(1.08) brightness(1.04) saturate(1.15);
+        }
+        #photo-placeholder {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            gap: 0.4rem;
+            color: #4b5563;
+            font-size: 0.75rem;
+            text-align: center;
+            padding: 0.5rem;
+        }
+        #photo-placeholder svg { opacity: 0.45; }
+        .photo-meta { flex: 1; }
+        .photo-meta .full-name {
+            font-size: 1.15rem;
+            font-weight: 600;
+            color: #f9fafb;
+            line-height: 1.3;
+            margin-bottom: 0.3rem;
+        }
+        .photo-meta .doc-type {
+            display: inline-block;
+            background: #00b4ff22;
+            border: 1px solid #00b4ff55;
+            border-radius: 4px;
+            padding: 0.15rem 0.55rem;
+            font-size: 0.75rem;
+            color: #7dd3fc;
+            font-family: monospace;
+            letter-spacing: 0.05em;
+        }
+        /* ── Fields grid ── */
+        .fields {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 0;
+        }
+        .field {
+            padding: 0.7rem 1.25rem;
+            border-bottom: 1px solid #374151;
+        }
+        .field:nth-child(odd) { border-right: 1px solid #374151; }
+        .field-label {
+            font-size: 0.7rem;
+            color: #6b7280;
+            text-transform: uppercase;
+            letter-spacing: 0.06em;
+            margin-bottom: 0.2rem;
+        }
+        .field-value {
+            font-size: 0.95rem;
+            color: #93c5fd;
+            font-family: monospace;
+            letter-spacing: 0.03em;
+            word-break: break-all;
+        }
+        .field-value:empty::after { content: '—'; color: #374151; }
+        /* ── Validity badge ── */
+        .validity {
+            padding: 0.6rem 1.25rem;
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+            font-size: 0.85rem;
+        }
+        .validity.valid   { background: #052e16; color: #4ade80; border-top: 1px solid #166534; }
+        .validity.invalid { background: #2d0a0a; color: #f87171; border-top: 1px solid #7f1d1d; }
+        /* ── Actions ── */
+        .actions {
+            display: flex;
+            gap: 0.75rem;
+            margin-top: 1.25rem;
+            width: 100%;
+            max-width: 680px;
+        }
+        .btn {
+            flex: 1;
+            padding: 0.65rem 1rem;
+            border-radius: 8px;
+            font-size: 0.9rem;
+            font-weight: 500;
+            cursor: pointer;
+            border: none;
+            transition: opacity 0.15s;
+        }
+        .btn:hover { opacity: 0.85; }
+        .btn-primary { background: #00b4ff; color: #000; }
+        .btn-outline { background: transparent; color: #9ca3af; border: 1px solid #374151; }
+
+        @media (max-width: 480px) {
+            .fields { grid-template-columns: 1fr; }
+            .field:nth-child(odd) { border-right: none; }
+            .photo-banner { flex-direction: column; align-items: flex-start; }
+        }
     </style>
 </head>
 <body>
     <h1>Passport Information</h1>
-    <form id="infoForm">
-        <label>Document type: <input name="documentCode" readonly /></label>
-        <label>Issuing country: <input name="issuingState" readonly /></label>
-        <label>Last name: <input name="lastName" readonly /></label>
-        <label>Given names: <input name="firstName" readonly /></label>
-        <label>Passport number: <input name="documentNumber" readonly /></label>
-        <label>Nationality: <input name="nationality" readonly /></label>
-        <label>Date of birth: <input name="birthDate" readonly /></label>
-        <label>Sex: <input name="sex" readonly /></label>
-        <label>Expiration date: <input name="expirationDate" readonly /></label>
-        <label>Personal number: <input name="personalNumber" readonly /></label>
-    </form>
+
+    <div class="card">
+        <!-- Annotated passport image with MRZ region marked -->
+        <div class="passport-image" id="passport-image">
+            <div class="label">Scanned passport — MRZ region detected</div>
+            <img id="passport-img" alt="Annotated passport scan" />
+        </div>
+
+        <!-- Photo + name header -->
+        <div class="photo-banner">
+            <div id="photo-frame">
+                <div id="photo-placeholder">
+                    <svg width="36" height="36" viewBox="0 0 24 24" fill="none" stroke="#9ca3af" stroke-width="1.5">
+                        <circle cx="12" cy="8" r="4"/><path d="M4 20c0-4 3.6-7 8-7s8 3 8 7"/>
+                    </svg>
+                    No photo
+                </div>
+            </div>
+            <div class="photo-meta">
+                <div class="full-name" id="full-name">—</div>
+                <div class="doc-type" id="doc-type">—</div>
+            </div>
+        </div>
+
+        <!-- Validity row -->
+        <div class="validity" id="validity-row">
+            <span id="validity-text">—</span>
+        </div>
+
+        <!-- Fields grid -->
+        <div class="fields">
+            <div class="field">
+                <div class="field-label">Document Number</div>
+                <div class="field-value" id="f-documentNumber"></div>
+            </div>
+            <div class="field">
+                <div class="field-label">Nationality</div>
+                <div class="field-value" id="f-nationality"></div>
+            </div>
+            <div class="field">
+                <div class="field-label">Date of Birth</div>
+                <div class="field-value" id="f-birthDate"></div>
+            </div>
+            <div class="field">
+                <div class="field-label">Sex</div>
+                <div class="field-value" id="f-sex"></div>
+            </div>
+            <div class="field">
+                <div class="field-label">Expiration Date</div>
+                <div class="field-value" id="f-expirationDate"></div>
+            </div>
+            <div class="field">
+                <div class="field-label">Issuing Country</div>
+                <div class="field-value" id="f-issuingState"></div>
+            </div>
+            <div class="field" style="grid-column: 1 / -1">
+                <div class="field-label">Personal Number</div>
+                <div class="field-value" id="f-personalNumber"></div>
+            </div>
+        </div>
+    </div>
+
+    <div class="actions">
+        <button class="btn btn-primary" onclick="window.location.href='index.html'">Scan Again</button>
+        <button class="btn btn-outline" onclick="window.print()">Print</button>
+    </div>
+
     <script>
-        function populate() {
-            const form = document.getElementById('infoForm');
-            // sessionStorage is preferred — serve's clean-URL 301 redirect strips query params
-            let data = {};
+        (function () {
+            /* ── Load data ── */
+            let data = {}, valid = false;
             try {
                 const stored = sessionStorage.getItem('mrzData');
-                if (stored) { data = JSON.parse(stored); sessionStorage.removeItem('mrzData'); }
-            } catch(e) {}
-            // Fall back to URL query params (works with python -m http.server etc.)
+                if (stored) {
+                    const parsed = JSON.parse(stored);
+                    sessionStorage.removeItem('mrzData');
+                    data = parsed.fields || parsed;
+                    valid = !!parsed.valid;
+                }
+            } catch (e) {}
             if (!Object.keys(data).length) {
                 for (const [k, v] of new URLSearchParams(window.location.search).entries()) data[k] = v;
             }
-            for (const [key, value] of Object.entries(data)) {
-                const input = form.elements[key];
-                if (input) input.value = value;
-            }
-        }
-        populate();
+
+            /* ── Photo ── */
+            const photoFrame = document.getElementById('photo-frame');
+            const photoPlaceholder = document.getElementById('photo-placeholder');
+            try {
+                const photoData = sessionStorage.getItem('personPhoto');
+                if (photoData) {
+                    sessionStorage.removeItem('personPhoto');
+                    // Show annotated passport image (full-width, with MRZ marked)
+                    const passportSection = document.getElementById('passport-image');
+                    const passportImg = document.getElementById('passport-img');
+                    passportImg.src = photoData;
+                    passportSection.style.display = 'block';
+                    // Also show in the small portrait frame
+                    const img = document.createElement('img');
+                    img.src = photoData;
+                    img.alt = 'Captured photo';
+                    photoPlaceholder.style.display = 'none';
+                    photoFrame.appendChild(img);
+                }
+            } catch (e) {}
+
+            /* ── Name + doc type ── */
+            const lastName  = (data.lastName  || '').replace(/</g, ' ').trim();
+            const firstName = (data.firstName || '').replace(/</g, ' ').trim();
+            const fullName  = [lastName, firstName].filter(Boolean).join(', ');
+            document.getElementById('full-name').textContent = fullName || '—';
+            document.getElementById('doc-type').textContent =
+                (data.documentCode || '') + (data.issuingState ? ' · ' + data.issuingState : '') || '—';
+
+            /* ── Validity ── */
+            const row = document.getElementById('validity-row');
+            const txt = document.getElementById('validity-text');
+            row.className = 'validity ' + (valid ? 'valid' : 'invalid');
+            txt.textContent = valid ? '✓ Checksum valid' : '✗ Checksum invalid — data may contain read errors';
+
+            /* ── Simple fields ── */
+            ['documentNumber','nationality','birthDate','sex','expirationDate','issuingState','personalNumber']
+                .forEach(k => {
+                    const el = document.getElementById('f-' + k);
+                    if (el) el.textContent = data[k] || '';
+                });
+        })();
     </script>
 </body>
 </html>
