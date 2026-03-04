@@ -153,11 +153,13 @@
         return dst;
     }
 
-    /* ── MRZ-rectangle locator ─────────────────────────────────────────────── */
-    // Downsamples the full camera frame to a 480-px-wide thumbnail, finds the
-    // densest horizontal text band (y-range) via row-density projection, then
-    // finds the horizontal extent (x-range) via column-density within that band.
-    // Returns {x1, y1, x2, y2} in video pixels, or null if nothing found.
+    /* ── MRZ-rectangle locator (gradient-energy, skew-tolerant) ─────────── */
+    // Uses squared horizontal Sobel gradient + box blur to build an "edge
+    // energy" map.  MRZ text has uniquely high density of vertical strokes
+    // spanning the full page width — this lights up as a bright band in the
+    // energy map regardless of lighting or binarisation threshold.
+    // Skew estimation is done only on the detected region for the polygon.
+    // Returns {x1,y1,x2,y2, corners, skewAngle} or null.
     function findMRZRect() {
         const vW = video.videoWidth, vH = video.videoHeight;
         const tScale = Math.min(1, 480 / vW);
@@ -169,43 +171,104 @@
         tCtx.drawImage(video, 0, 0, tW, tH);
         const d = tCtx.getImageData(0, 0, tW, tH).data;
 
-        // Helper: luma < 130 = dark pixel
-        const isDark = (i) => (d[i] * 77 + d[i + 1] * 150 + d[i + 2] * 29) >> 8 < 130;
-
-        // Row density: fraction of dark pixels per row
-        const density = new Float32Array(tH);
-        for (let y = 0; y < tH; y++) {
-            let dark = 0;
-            for (let x = 0; x < tW; x++) if (isDark((y * tW + x) * 4)) dark++;
-            density[y] = dark / tW;
+        // Grayscale
+        const gray = new Float32Array(tW * tH);
+        for (let i = 0; i < gray.length; i++) {
+            const j = i * 4;
+            gray[i] = (d[j] * 77 + d[j + 1] * 150 + d[j + 2] * 29) >> 8;
         }
 
-        // Smooth rows with a 9-px half-window
+        // ── 1. Squared horizontal Sobel gradient ──
+        // Highlights vertical edges (character strokes). Squaring emphasises
+        // strong edges and makes everything positive.
+        const gx2 = new Float32Array(tW * tH);
+        for (let y = 0; y < tH; y++) {
+            const off = y * tW;
+            for (let x = 1; x < tW - 1; x++) {
+                const g = gray[off + x + 1] - gray[off + x - 1];
+                gx2[off + x] = g * g;
+            }
+        }
+
+        // ── 2. Horizontal box blur (merge character strokes into bands) ──
+        const hR = Math.max(5, Math.round(tW * 0.04));
+        const hBlur = new Float32Array(tW * tH);
+        const hPfx = new Float64Array(tW + 1);
+        for (let y = 0; y < tH; y++) {
+            const off = y * tW;
+            hPfx[0] = 0;
+            for (let x = 0; x < tW; x++) hPfx[x + 1] = hPfx[x] + gx2[off + x];
+            for (let x = 0; x < tW; x++) {
+                const l = Math.max(0, x - hR), r = Math.min(tW - 1, x + hR);
+                hBlur[off + x] = (hPfx[r + 1] - hPfx[l]) / (r - l + 1);
+            }
+        }
+
+        // ── 3. Vertical box blur (merge the 2–3 MRZ text lines) ──
+        const vR = Math.max(2, Math.round(tH * 0.025));
+        const energy = new Float32Array(tW * tH);
+        const vPfx = new Float64Array(tH + 1);
+        for (let x = 0; x < tW; x++) {
+            vPfx[0] = 0;
+            for (let y = 0; y < tH; y++) vPfx[y + 1] = vPfx[y] + hBlur[y * tW + x];
+            for (let y = 0; y < tH; y++) {
+                const t = Math.max(0, y - vR), b = Math.min(tH - 1, y + vR);
+                energy[y * tW + x] = (vPfx[b + 1] - vPfx[t]) / (b - t + 1);
+            }
+        }
+
+        // ── 4. Row scoring: mean energy × spread ──
+        const rowMean = new Float32Array(tH);
+        let globalMax = 0;
+        for (let y = 0; y < tH; y++) {
+            let s = 0;
+            for (let x = 0; x < tW; x++) s += energy[y * tW + x];
+            rowMean[y] = s / tW;
+            if (rowMean[y] > globalMax) globalMax = rowMean[y];
+        }
+        if (globalMax === 0) return null;
+
+        // Spread: fraction of columns above 25 % of global max energy.
+        // MRZ rows have high energy spanning nearly the full width.
+        const spreadTh = globalMax * 0.25;
+        const rowScore = new Float32Array(tH);
+        for (let y = 0; y < tH; y++) {
+            let above = 0;
+            for (let x = 0; x < tW; x++) if (energy[y * tW + x] > spreadTh) above++;
+            rowScore[y] = (rowMean[y] / globalMax) * (above / tW);
+        }
+
+        // Smooth
         const smooth = new Float32Array(tH);
         for (let y = 0; y < tH; y++) {
             let s = 0, n = 0;
-            for (let dy = -9; dy <= 9; dy++) {
+            for (let dy = -4; dy <= 4; dy++) {
                 const yy = y + dy;
-                if (yy >= 0 && yy < tH) { s += density[yy]; n++; }
+                if (yy >= 0 && yy < tH) { s += rowScore[yy]; n++; }
             }
             smooth[y] = s / n;
         }
 
-        // Adaptive threshold: global mean × 2.5, clamped
-        let mean = 0;
-        for (let y = 0; y < tH; y++) mean += smooth[y];
-        mean /= tH;
-        const thresh = Math.max(0.06, Math.min(0.35, mean * 2.5));
+        // ── 5. Find best band in bottom 60 % ──
+        const searchY = Math.floor(tH * 0.40);
+        const maxBandH = Math.round(tH * 0.25);
 
-        // Find the highest-scoring contiguous run above threshold (y-band)
+        let maxSmooth = 0;
+        for (let y = searchY; y < tH; y++)
+            if (smooth[y] > maxSmooth) maxSmooth = smooth[y];
+        if (maxSmooth === 0) return null;
+
+        const bandTh = maxSmooth * 0.30;
         let bestY1 = -1, bestY2 = -1, bestScore = 0;
         let runY1 = -1, runScore = 0;
-        for (let y = 0; y <= tH; y++) {
-            if (y < tH && smooth[y] >= thresh) {
+
+        for (let y = searchY; y <= tH; y++) {
+            if (y < tH && smooth[y] >= bandTh) {
                 if (runY1 < 0) { runY1 = y; runScore = 0; }
                 runScore += smooth[y];
             } else if (runY1 >= 0) {
-                if (runScore > bestScore) {
+                const bh = y - runY1;
+                if (runScore > bestScore && bh <= maxBandH && bh >= 3) {
                     bestScore = runScore;
                     bestY1 = runY1;
                     bestY2 = y - 1;
@@ -216,57 +279,126 @@
 
         if (bestY1 < 0) return null;
 
-        // Column density within the detected y-band → find x-bounds
+        // ── 6. X-bounds (columns within band above 10 % of max energy) ──
         const bandH = bestY2 - bestY1 + 1;
-        const colDensity = new Float32Array(tW);
+        const colE = new Float32Array(tW);
         for (let x = 0; x < tW; x++) {
-            let dark = 0;
-            for (let y = bestY1; y <= bestY2; y++) if (isDark((y * tW + x) * 4)) dark++;
-            colDensity[x] = dark / bandH;
+            let s = 0;
+            for (let y = bestY1; y <= bestY2; y++) s += energy[y * tW + x];
+            colE[x] = s / bandH;
         }
-
-        // Smooth columns with a 5-px half-window
-        const smoothCol = new Float32Array(tW);
-        for (let x = 0; x < tW; x++) {
-            let s = 0, n = 0;
-            for (let dx = -5; dx <= 5; dx++) {
-                const xx = x + dx;
-                if (xx >= 0 && xx < tW) { s += colDensity[xx]; n++; }
-            }
-            smoothCol[x] = s / n;
-        }
-
-        // Find leftmost / rightmost columns above 4% density
-        const colThresh = 0.04;
+        const colTh = globalMax * 0.10;
         let tx1 = 0, tx2 = tW - 1;
-        for (let x = 0; x < tW; x++)        if (smoothCol[x] >= colThresh) { tx1 = x; break; }
-        for (let x = tW - 1; x >= 0; x--)   if (smoothCol[x] >= colThresh) { tx2 = x; break; }
+        for (let x = 0; x < tW; x++)       if (colE[x] >= colTh) { tx1 = x; break; }
+        for (let x = tW - 1; x >= 0; x--)  if (colE[x] >= colTh) { tx2 = x; break; }
+
+        const regionW = tx2 - tx1 + 1;
+        if (regionW < 10 || bandH < 3) return null;
+
+        // ── 7. Skew estimation on detected region for polygon ──
+        // Binarise just the detected region using local mean threshold
+        let graySum = 0;
+        for (let y = bestY1; y <= bestY2; y++)
+            for (let x = tx1; x <= tx2; x++)
+                graySum += gray[y * tW + x];
+        const regionMean = graySum / (regionW * bandH);
+
+        const regionBin = new Uint8Array(regionW * bandH);
+        for (let ry = 0; ry < bandH; ry++)
+            for (let rx = 0; rx < regionW; rx++)
+                regionBin[ry * regionW + rx] =
+                    gray[(bestY1 + ry) * tW + (tx1 + rx)] < regionMean - 10 ? 1 : 0;
+
+        // Projection-profile skew estimation on the region
+        const step = Math.max(1, Math.round(regionW / 120));
+        const sw = Math.ceil(regionW / step), sh = Math.ceil(bandH / step);
+        const sg = new Uint8Array(sw * sh);
+        for (let sy = 0; sy < sh; sy++)
+            for (let sx = 0; sx < sw; sx++)
+                sg[sy * sw + sx] = regionBin[(sy * step) * regionW + sx * step];
+
+        const pcx = sw / 2, pcy = sh / 2, pLen = sw + sh;
+        let bestAngle = 0, bestVar = -1;
+        for (let deg = -15; deg <= 15; deg += 1) {
+            const rad = deg * Math.PI / 180;
+            const cosA = Math.cos(rad), sinA = Math.sin(rad);
+            const proj = new Int32Array(pLen);
+            for (let py = 0; py < sh; py++)
+                for (let px = 0; px < sw; px++)
+                    if (sg[py * sw + px]) {
+                        const ry = Math.round(-(px - pcx) * sinA + (py - pcy) * cosA + pcy);
+                        if (ry >= 0 && ry < pLen) proj[ry]++;
+                    }
+            let sum = 0, sum2 = 0;
+            for (let i = 0; i < sh; i++) { sum += proj[i]; sum2 += proj[i] * proj[i]; }
+            const v = sum2 - (sum * sum) / sh;
+            if (v > bestVar) { bestVar = v; bestAngle = deg; }
+        }
+        const skewAngle = bestAngle;
+
+        // ── 8. Build rotated polygon corners ──
+        const invScale = 1 / tScale;
+        const cx = (tx1 + tx2) / 2, cy = (bestY1 + bestY2) / 2;
+        const hw = regionW / 2, hh = bandH / 2;
+        const rad = skewAngle * Math.PI / 180;
+        const cosR = Math.cos(rad), sinR = Math.sin(rad);
+
+        // Rectangle corners rotated by skewAngle around the region centre
+        const localCorners = [
+            { x: -hw, y: -hh }, { x: hw, y: -hh },
+            { x: hw, y: hh },  { x: -hw, y: hh },
+        ];
+
+        let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
+        const videoCorners = localCorners.map(p => {
+            // CW rotation: x' = x*cos - y*sin,  y' = x*sin + y*cos
+            const rx = (p.x * cosR - p.y * sinR + cx) * invScale;
+            const ry = (p.x * sinR + p.y * cosR + cy) * invScale;
+            if (rx < minX) minX = rx;
+            if (rx > maxX) maxX = rx;
+            if (ry < minY) minY = ry;
+            if (ry > maxY) maxY = ry;
+            return { x: Math.round(rx), y: Math.round(ry) };
+        });
 
         return {
-            x1: Math.max(0, Math.round(tx1 / tScale)),
-            y1: Math.max(0, Math.round(bestY1 / tScale)),
-            x2: Math.min(vW - 1, Math.round(tx2 / tScale)),
-            y2: Math.min(vH - 1, Math.round(bestY2 / tScale)),
+            x1: Math.max(0, Math.round(minX)),
+            y1: Math.max(0, Math.round(minY)),
+            x2: Math.min(vW - 1, Math.round(maxX)),
+            y2: Math.min(vH - 1, Math.round(maxY)),
+            corners: videoCorners,
+            skewAngle,
         };
     }
 
-    /* ── Draw MRZ rectangle on overlay ─────────────────────────────────────── */
+    /* ── Draw MRZ region on overlay ───────────────────────────────────────── */
     function drawMRZRect(rect) {
         const vW = video.videoWidth, vH = video.videoHeight;
         if (!vW || !vH) return;
         const sx = overlay.width / vW, sy = overlay.height / vH;
-        const rx = rect.x1 * sx, ry = rect.y1 * sy;
-        const rw = (rect.x2 - rect.x1) * sx, rh = (rect.y2 - rect.y1) * sy;
 
-        // Green rectangle with rounded corners
-        ovCtx.strokeStyle = '#00ff88';
-        ovCtx.lineWidth   = 2;
-        ovCtx.lineJoin    = 'round';
-        ovCtx.strokeRect(rx, ry, rw, rh);
-
-        // Semi-transparent fill
-        ovCtx.fillStyle = 'rgba(0, 255, 136, 0.08)';
-        ovCtx.fillRect(rx, ry, rw, rh);
+        if (rect.corners && rect.corners.length === 4) {
+            ovCtx.beginPath();
+            ovCtx.moveTo(rect.corners[0].x * sx, rect.corners[0].y * sy);
+            for (let i = 1; i < 4; i++)
+                ovCtx.lineTo(rect.corners[i].x * sx, rect.corners[i].y * sy);
+            ovCtx.closePath();
+            ovCtx.strokeStyle = '#00ff88';
+            ovCtx.lineWidth   = 2;
+            ovCtx.lineJoin    = 'round';
+            ovCtx.stroke();
+            ovCtx.fillStyle = 'rgba(0, 255, 136, 0.08)';
+            ovCtx.fill();
+        } else {
+            const rx = rect.x1 * sx, ry = rect.y1 * sy;
+            const rw = (rect.x2 - rect.x1) * sx, rh = (rect.y2 - rect.y1) * sy;
+            ovCtx.strokeStyle = '#00ff88';
+            ovCtx.lineWidth   = 2;
+            ovCtx.lineJoin    = 'round';
+            ovCtx.strokeRect(rx, ry, rw, rh);
+            ovCtx.fillStyle = 'rgba(0, 255, 136, 0.08)';
+            ovCtx.fillRect(rx, ry, rw, rh);
+        }
     }
 
     /* ── MRZ-region capture ────────────────────────────────────────────────── */
@@ -487,26 +619,38 @@
         ctx.drawImage(video, 0, 0, cW, cH);
         enhanceColor(canvas, ctx);
 
-        // Draw MRZ region rectangle on the captured photo
-        if (mrzRect) {
-            const rx = mrzRect.x1 * scale, ry = mrzRect.y1 * scale;
-            const rw = (mrzRect.x2 - mrzRect.x1) * scale;
-            const rh = (mrzRect.y2 - mrzRect.y1) * scale;
-            // Semi-transparent green fill
+        // Draw MRZ region polygon on the captured photo
+        if (mrzRect && mrzRect.corners && mrzRect.corners.length === 4) {
+            ctx.beginPath();
+            ctx.moveTo(mrzRect.corners[0].x * scale, mrzRect.corners[0].y * scale);
+            for (let i = 1; i < 4; i++)
+                ctx.lineTo(mrzRect.corners[i].x * scale, mrzRect.corners[i].y * scale);
+            ctx.closePath();
             ctx.fillStyle = 'rgba(0, 255, 136, 0.15)';
-            ctx.fillRect(rx, ry, rw, rh);
-            // Green border
+            ctx.fill();
             ctx.strokeStyle = '#00ff88';
             ctx.lineWidth   = Math.max(2, cW * 0.004);
             ctx.lineJoin    = 'round';
-            ctx.strokeRect(rx, ry, rw, rh);
-            // "MRZ" label
+            ctx.stroke();
+            // "MRZ" label at top-left corner
             const fontSize = Math.max(10, cW * 0.018);
             ctx.font         = `bold ${fontSize}px sans-serif`;
             ctx.textBaseline = 'bottom';
             ctx.textAlign    = 'left';
             ctx.fillStyle    = '#00ff88';
-            ctx.fillText('MRZ', rx + 4, ry - 3);
+            const topY = Math.min(...mrzRect.corners.map(c => c.y));
+            const topX = mrzRect.corners.reduce((a, c) => c.y <= topY + 2 && c.x < a ? c.x : a, Infinity);
+            ctx.fillText('MRZ', topX * scale + 4, topY * scale - 3);
+        } else if (mrzRect) {
+            const rx = mrzRect.x1 * scale, ry = mrzRect.y1 * scale;
+            const rw = (mrzRect.x2 - mrzRect.x1) * scale;
+            const rh = (mrzRect.y2 - mrzRect.y1) * scale;
+            ctx.fillStyle = 'rgba(0, 255, 136, 0.15)';
+            ctx.fillRect(rx, ry, rw, rh);
+            ctx.strokeStyle = '#00ff88';
+            ctx.lineWidth   = Math.max(2, cW * 0.004);
+            ctx.lineJoin    = 'round';
+            ctx.strokeRect(rx, ry, rw, rh);
         }
 
         return canvas.toDataURL('image/jpeg', 0.88);
@@ -666,7 +810,7 @@
         }
         try {
             const stream = await navigator.mediaDevices.getUserMedia({
-                video: { facingMode: 'environment', width: { ideal: 1280 }, height: { ideal: 720 } },
+                video: { facingMode: 'environment', width: { ideal: 640 }, height: { ideal: 480 } },
             });
             if (permState === 'prompt') {
                 permTip.textContent =
