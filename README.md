@@ -1,4 +1,4 @@
-# MRZ Web Scanner
+# MRZ-PASSPORT
 
 This simple web application uses the webcam to scan the Machine Readable Zone (MRZ) of a passport or ID document. When a valid MRZ is detected, it navigates to a result page and fills in the form fields with the extracted data.
 

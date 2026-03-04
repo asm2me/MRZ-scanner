@@ -1,4 +1,7 @@
 {
+  "name": "mrz-passport",
+  "version": "1.0.0",
+  "description": "MRZ Web Scanner for Passport and ID Documents",
   "dependencies": {
     "mrz": "^5.0.1",
     "tesseract.js": "^7.0.0"
